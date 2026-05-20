@@ -17,7 +17,7 @@ DTYPES = ["float16"]
 
 
 @tilelang.jit(target="npuir")
-def slice_reduce(block_M, block_N, dtype="float16"):
+def slice_reduce_size_dev(block_M, block_N, dtype="float16"):
     M = T.symbolic("M")
     N = T.symbolic("N")
     BLOCK_SIZE = 1
@@ -39,8 +39,11 @@ def slice_reduce(block_M, block_N, dtype="float16"):
                     offset_m = j * block_M
                     remain_m = T.min(block_M, M - offset_m)
                     T.copy(
-                        Input[offset_m : offset_m + remain_m, offset_n : offset_n + remain_n],
-                        src,
+                        Input[
+                            offset_m : offset_m + remain_m,
+                            offset_n : offset_n + remain_n,
+                        ],
+                        src[0:remain_m, 0:remain_n],
                     )
                     T.npuir_reduce(
                         src,
@@ -50,14 +53,14 @@ def slice_reduce(block_M, block_N, dtype="float16"):
                         size=[remain_m, remain_n],
                         clear=False,
                     )
-                T.copy(dst, Output[0:1, offset_n : offset_n + remain_n])
+                T.copy(dst[0, 0:remain_n], Output[0:1, offset_n : offset_n + remain_n])
 
     return sliceReduceSizeDev
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_slice_reduce_size_case1(dtype):
-    kernel = slice_reduce(32, 32)
+    kernel = slice_reduce_size_dev(32, 32)
     M, N = 17, 256
     input_t = gen_tensor((M, N), dtype, kind="randn")
     output = gen_tensor((1, N), dtype, kind="randn")
@@ -68,7 +71,7 @@ def test_slice_reduce_size_case1(dtype):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_slice_reduce_size_case2(dtype):
-    kernel = slice_reduce(32, 32)
+    kernel = slice_reduce_size_dev(32, 32)
     M, N = 39, 466
     input_t = gen_tensor((M, N), dtype, kind="randn")
     output = gen_tensor((1, N), dtype, kind="randn")
@@ -79,7 +82,7 @@ def test_slice_reduce_size_case2(dtype):
 
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_slice_reduce_size_case3(dtype):
-    kernel = slice_reduce(32, 32)
+    kernel = slice_reduce_size_dev(32, 32)
     M, N = 77, 283
     input_t = gen_tensor((M, N), dtype, kind="randn")
     output = gen_tensor((1, N), dtype, kind="randn")

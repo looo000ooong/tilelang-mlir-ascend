@@ -2,11 +2,11 @@
 
 ## 1. OP概述
 
-简介：`tilelang.language.vsqrt`返回输入向量/标量基于输出形状的sqrt计算结果
+简介：`tilelang.language.vsqrt`返回输入向量/标量基于输入形状的sqrt计算结果
 
 sqrt计算公式：x^0.5
 
-```
+```python
 T.vsqrt(src, dst)
 ```
 
@@ -34,24 +34,25 @@ T.vsqrt(src, dst)
 ### 2.3 使用方法
 
 ```python
+@tilelang.jit(target="npuir")
 def vsqrt_kernel(M, N, dtype):
     BLOCK_SIZE = 1
 
     @T.prim_func
     def main(
-            A: T.Tensor((M, N), dtype),
-            B: T.Tensor((M, N), dtype),
+        A: T.Tensor((M, N), dtype),
+        B: T.Tensor((M, N), dtype),
     ):
         with T.Kernel(BLOCK_SIZE, is_npu=True) as (cid, _):
             src_ub = T.alloc_shared((M, N), dtype)
             dst_ub = T.alloc_shared((M, N), dtype)
 
-            T.copy(src, src_ub)
+            T.copy(A, src_ub)
             T.vsqrt(src_ub, dst_ub)
-            T.copy(dst_ub, dst)
+            T.copy(dst_ub, B)
+
     return main
 ```
-
 
 ## 3. Tilelang Op到Ascend NPU IR Op的转换
 

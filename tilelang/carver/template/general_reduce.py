@@ -2,9 +2,8 @@
 # Licensed under the MIT License.
 
 from dataclasses import dataclass
-from .base import BaseTemplate
+from .base import BaseTemplate, AscendArch
 from tvm import te
-from ..arch import TileDevice
 from ..roller import Hint
 from typing import List, Union
 from ..utils import get_roller_hints_from_func
@@ -12,15 +11,22 @@ from ..utils import get_roller_hints_from_func
 
 @dataclass
 class GeneralReductionTemplate(BaseTemplate):
-
     # OP Related Config
     structure: Union[str, List[str]] = None
     shape: List[int] = None
     dtype: str = "float16"
+    custom_mem_mul: float = 1
 
-    def get_hardware_aware_configs(self, arch: TileDevice = None, topk: int = 10) -> List[Hint]:
+    def get_hardware_aware_configs(
+        self, arch: AscendArch = None, topk: int = 10
+    ) -> List[Hint]:
         roller_hints = get_roller_hints_from_func(
-            self._func, arch=arch, topk=topk, allow_gemv=False)
+            self._func,
+            arch=arch,
+            topk=topk,
+            allow_gemv=False,
+            custom_mem_mul=self.custom_mem_mul,
+        )
         return roller_hints
 
     def initialize_function(self) -> None:
@@ -41,12 +47,14 @@ class GeneralReductionTemplate(BaseTemplate):
         spatial_axes = []
         reduce_axes = []
         for i, axis_type in enumerate(self.structure):
-            if axis_type.upper() == 'S':
+            if axis_type.upper() == "S":
                 spatial_axes.append((i, self.shape[i]))
-            elif axis_type.upper() == 'R':
+            elif axis_type.upper() == "R":
                 reduce_axes.append((i, self.shape[i]))
             else:
-                raise ValueError(f"Unrecognized axis type '{axis_type}', only 'S'/'R' allowed.")
+                raise ValueError(
+                    f"Unrecognized axis type '{axis_type}', only 'S'/'R' allowed."
+                )
 
         # Create input placeholder
         A = te.placeholder(shape=self.shape, dtype=self.dtype, name="A")
@@ -93,7 +101,7 @@ class GeneralReductionTemplate(BaseTemplate):
 
             # Walk through the structure in order
             for axis_type in self.structure:
-                if axis_type.upper() == 'S':
+                if axis_type.upper() == "S":
                     # use the next spatial_indices item
                     full_index.append(spatial_indices[spatial_iter])
                     spatial_iter += 1

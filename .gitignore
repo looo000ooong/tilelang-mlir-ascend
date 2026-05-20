@@ -102,3 +102,5 @@ examples/simt/profile_runs/
 
 # workspace
 .workspace/
+# thirdparty
+**/third_party/

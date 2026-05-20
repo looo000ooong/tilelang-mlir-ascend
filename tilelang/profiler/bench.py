@@ -2,8 +2,13 @@
 # Licensed under the MIT License.
 """The profiler and convert to torch utils"""
 
-import torch
+import builtins
+import os
+import shutil
 from typing import Callable, List, Literal, Optional, Union
+
+import torch
+
 
 def do_bench(
     fn: Callable,
@@ -17,13 +22,13 @@ def do_bench(
     return_mode: Literal["min", "max", "mean", "median"] = "mean",
 ) -> Union[float, List[float]]:
     """Benchmarks the runtime of a PyTorch function.
-    
+
     This function handles:
     - L2 cache flushing between runs for consistent timing
     - Automatic warmup and repeat count calculation
     - Optional gradient clearing for backward passes
     - Multiple measurement modes (mean, median, min, max)
-    
+
     Args:
         fn: Function to benchmark
         warmup: Target warmup time in milliseconds
@@ -34,7 +39,7 @@ def do_bench(
         quantiles: Optional performance percentiles to compute
         fast_flush: Whether to use faster L2 cache flushing
         return_mode: How to aggregate timing results ("mean", "median", "min", "max")
-        
+
     Returns:
         float: Aggregated runtime in milliseconds
     """
@@ -90,7 +95,7 @@ def do_bench(
     # Record clocks
     torch.npu.synchronize()
     times = torch.tensor(
-        [s.elapsed_time(e) for s, e in zip(start_event, end_event)],
+        [s.elapsed_time(e) for s, e in zip(start_event, end_event, strict=True)],
         dtype=torch.float,
     )
     if quantiles is not None:
@@ -100,30 +105,23 @@ def do_bench(
         return ret
     return getattr(torch, return_mode)(times).item()
 
-import builtins
-import os
 
-def do_bench_npu(fn: Callable, 
-    warmup: float = 25,
-    rep=30, 
-    prof_dir=None, 
-    keep_res=False):
+def do_bench_npu(funcs, warmup: float = 5, rep=30, prof_dir=None, keep_res=False):
     import torch_npu
 
-    fn()
-    torch.npu.synchronize()
+    for fn in funcs:
+        fn()
+        torch.npu.synchronize()
 
     experimental_config = torch_npu.profiler._ExperimentalConfig(
         aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
         profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
         data_simplification=False,
     )
-
     if prof_dir is not None:
         torch_path = prof_dir
     else:
-        torch_path = os.path.join(os.environ.get('TILELANG_CACHE_DIR'), 'autotuner_tmp')
-
+        torch_path = os.path.join(os.environ.get("TILELANG_CACHE_DIR"), "autotuner_tmp")
 
     total = warmup + rep
     with torch_npu.profiler.profile(
@@ -135,26 +133,27 @@ def do_bench_npu(fn: Callable,
         with_flops=False,
         with_modules=False,
         experimental_config=experimental_config,
-    ) as prof:
-        
-        for _ in builtins.range(total):
-            fn()
-       
-    funcs = [fn]
+    ):
+        for fn in funcs:
+            for _ in builtins.range(total):
+                fn()
+            torch.npu.synchronize()
+
     time_cost = _collect_prof_result(torch_path, funcs, warmup, rep)
-    _rm_dic(keep_res, torch_path)
+
+    if not keep_res:
+        _remove_dir(torch_path)
+
     return time_cost
 
 
-def _rm_dic(keep_res, torch_path):
-    if keep_res:
-        return
-    import shutil
+def _remove_dir(path: str) -> None:
+    """Delete *path* and its contents if it exists."""
+    if os.path.exists(path):
+        shutil.rmtree(path)
 
-    if os.path.exists(torch_path):
-        shutil.rmtree(torch_path)
 
-def _collect_prof_result(base_dir: str, funcs, num_warmup: int, num_active: int, key: str = None):
+def _collect_prof_result(base_dir: str, funcs, num_warmup: int, num_active: int):
     """
     Collect kernel performance from kernel_details.csv, returned in millisecond.
     The first `num_warmup` rows of each function are warmup data and will be ignored, the next `num_active` rows will be averaged.
@@ -167,8 +166,6 @@ def _collect_prof_result(base_dir: str, funcs, num_warmup: int, num_active: int,
     :type num_warmup: int
     :param num_active: active count in kernel_details.csv of each fn
     :type num_active: int
-    :param key: filter key for kernel name
-    :type key: str
     """
 
     import numpy as np
@@ -191,10 +188,8 @@ def _collect_prof_result(base_dir: str, funcs, num_warmup: int, num_active: int,
     # filter out l2 cache clearing operation
     filter_cond = ~df["Type"].str.contains(r"^ReduceSum$", case=False, na=False)
     filter_df = df[filter_cond]
-    if key is not None:
-        key_rows = filter_df[filter_df["Name"].str.contains(key, na=False)]
-    else:
-        key_rows = filter_df
+
+    key_rows = filter_df
     time_cost = [0] * num_funcs
     for func_idx in np.arange(0, num_funcs):
         for active_index in np.arange(0, num_active):

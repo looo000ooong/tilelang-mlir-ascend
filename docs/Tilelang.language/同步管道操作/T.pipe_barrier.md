@@ -4,7 +4,7 @@
 
 简介：`tilelang.language.pipe_barrier` 在指定管道上设置屏障，用于同步管道操作
 
-```
+```python
 T.pipe_barrier(pipe)
 ```
 
@@ -36,21 +36,15 @@ T.pipe_barrier(pipe)
 
 以下示例展示了在管道操作中使用pipe_barrier进行同步
 
-```
-import torch
-import torch_npu
-import tilelang
-import tilelang.language as T
-
+```python
+@tilelang.jit(target="npuir")
 def pipe_barrier_kernel(M, N, dtype):
     BLOCK_SIZE = 1
 
     @T.prim_func
-    def main(src: T.Tensor((M, N), dtype),
-             dst: T.Tensor((M, N), dtype)):
+    def main(src: T.Tensor((M, N), dtype), dst: T.Tensor((M, N), dtype)):
 
         with T.Kernel(BLOCK_SIZE, is_npu=True) as (cid, _):
-
             src_ub = T.alloc_shared((M, N), dtype)
             dst_ub = T.alloc_shared((M, N), dtype)
 
@@ -69,4 +63,4 @@ def pipe_barrier_kernel(M, N, dtype):
 
 ## 3. Tilelang Op到Ascend NPU IR Op的转换
 
-**tilelang::barrierOp**将被下降为`mlir::hivm::PipeBarrierOp`
+**tilelang::barrierOp**将被转换为`mlir::hivm::PipeBarrierOp`

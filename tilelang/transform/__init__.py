@@ -89,8 +89,11 @@ def LowerHopperIntrin():
     fpass : tvm.transform.Pass
         The result pass
     """
-    return _ffi_api.LowerHopperIntrin() \
-        if hasattr(_ffi_api, "LowerHopperIntrin") else lambda f: f # type: ignore
+    return (
+        _ffi_api.LowerHopperIntrin()
+        if hasattr(_ffi_api, "LowerHopperIntrin")
+        else lambda f: f
+    )  # type: ignore
 
 
 def WarpSpecializedPipeline():
@@ -235,6 +238,28 @@ def LegalizeSafeMemoryAccess():
     return _ffi_api.LegalizeSafeMemoryAccess()  # type: ignore
 
 
+def LegalizeNpuirBF16():
+    """Legalize unsupported BF16 NPUIR ops into fp32 compute plus casts.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.LegalizeNpuirBF16()  # type: ignore
+
+
+def LowerNpuirBlock():
+    """Lower remaining Block/BlockRealize nodes for NPUIR codegen.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.LowerNpuirBlock()  # type: ignore
+
+
 def MakePackedAPI():
     """MakePackedAPI
 
@@ -330,8 +355,7 @@ def FlattenBuffer():
 
 
 def EliminateStorageSyncForMBarrier():
-    """EliminateStorageSyncForMBarrier
-    """
+    """EliminateStorageSyncForMBarrier"""
     return _ffi_api.EliminateStorageSyncForMBarrier()  # type: ignore
 
 
@@ -344,6 +368,7 @@ def MergeSharedMemoryAllocations():
         The result pass
     """
     return _ffi_api.MergeSharedMemoryAllocations()  # type: ignore
+
 
 def NpuLoopVectorize():
     """Lower one dimensional parallel loops to vector api for npu

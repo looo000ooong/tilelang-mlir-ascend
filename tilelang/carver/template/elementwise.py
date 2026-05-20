@@ -3,9 +3,8 @@
 
 # Import necessary modules
 from dataclasses import dataclass  # Used for defining data classes
-from .base import BaseTemplate  # Importing the base class for templates
+from .base import BaseTemplate, AscendArch  # Importing the base class for templates
 from tvm import te  # Importing TVM's tensor expression module
-from ..arch import TileDevice  # Importing TileDevice for hardware-specific configurations
 from ..roller import Hint  # Importing Hint for optimization hints
 from typing import List  # Importing List type hint
 from ..utils import get_roller_hints_from_func  # Function to obtain optimization hints
@@ -24,19 +23,28 @@ class ElementwiseTemplate(BaseTemplate):
     # OP Related Config
     shape: List[int] = None  # Shape of the tensor
     dtype: str = "float16"  # Data type of the tensor
+    custom_mem_mul: float = 1
 
-    def get_hardware_aware_configs(self, arch: TileDevice = None, topk: int = 10) -> List[Hint]:
+    def get_hardware_aware_configs(
+        self, arch: AscendArch = None, topk: int = 10
+    ) -> List[Hint]:
         """
         Retrieves hardware-aware optimization configurations.
 
         Args:
-            arch (TileDevice, optional): The target hardware architecture.
+            arch (AscendArch, optional): The target hardware architecture.
             topk (int, optional): Number of top configurations to consider.
 
         Returns:
             List[Hint]: A list of optimization hints for the given architecture.
         """
-        roller_hints = get_roller_hints_from_func(self._func, arch=arch, topk=topk, allow_gemv=True)
+        roller_hints = get_roller_hints_from_func(
+            self._func,
+            arch=arch,
+            topk=topk,
+            allow_gemv=True,
+            custom_mem_mul=self.custom_mem_mul,
+        )
         return roller_hints
 
     def initialize_function(self) -> None:
@@ -48,22 +56,30 @@ class ElementwiseTemplate(BaseTemplate):
         """
         shape, dtype = self.shape, self.dtype  # Extract shape and dtype
 
-        # Define a placeholder tensor A
+        # Define a placeholder tensor A, B
+        shape.insert(0, 1)
         A = te.placeholder(shape, name="A", dtype=dtype)
+        B = te.placeholder(shape, name="B", dtype=dtype)
+
+        k = te.reduce_axis((0, 1), name="k")
 
         # Define the element-wise computation (adding 1 to each element)
         def _compute_elementwise(*indices):
-            return A[indices] + 1
+            indices_k = [k]
+            for i in indices:
+                indices_k.append(i)
+            return te.sum(A[tuple(indices_k)] + B[tuple(indices_k)], axis=k)
 
+        shape.pop(0)
         # Define the computation for B based on A
-        B = te.compute(
+        C = te.compute(
             shape,
             fcompute=_compute_elementwise,  # Function that defines element-wise computation
-            name="B",
+            name="C",
         )
 
         # Store input and output tensors as function arguments
-        args = [A, B]
+        args = [A, B, C]
 
         # Create and set the computation function
         self.set_function(te.create_prim_func(args))

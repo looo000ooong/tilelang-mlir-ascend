@@ -27,14 +27,16 @@
 
 #include <tvm/arith/analyzer.h>
 #include <tvm/arith/pattern.h>
+#include <tvm/runtime/registry.h>
 #include <tvm/tir/analysis.h>
 #include <tvm/tir/builtin.h>
+#include <tvm/tir/expr.h>
+#include <tvm/tir/op.h>
+#include <tvm/tir/stmt.h>
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
-#include <tvm/tir/op.h>
-#include <tvm/tir/expr.h>
-#include <tvm/tir/stmt.h>
-#include <tvm/runtime/registry.h>
+
+#include <sstream>
 
 #include "arith/scalable_expression.h"
 #include "tir/analysis/check_contains.h"
@@ -46,738 +48,1147 @@ using namespace tir;
 
 class LoopDecompose : public StmtMutator {
 private:
-  // Temporary buffers of subexpression results when processing compound expressions
+  // All temporary buffers allocated within the current block,
+  // registered collectively in VisitStmt_(BlockNode).
   std::vector<Buffer> tmp_buffers;
-  // Recursion depth when processing compound expressions recursively
+
+  // Records the recursion depth of the current nested expression,
+  // managed via DepthGuard.
   int depth = 0;
 
+  // Stack of parallel loop variables currently being processed (outer ->
+  // inner).
+  std::vector<const VarNode *> current_loop_vars_;
+  std::vector<int64_t> current_loop_extents_;
+  std::vector<PrimExpr> current_loop_mins_;
+
+  // Statements that need to be hoisted before the outermost parallel loop
+  // (copy / reshape / brc).
+  std::vector<Stmt> hoisted_stmts_;
+
+  // ============================================================
+  // Op mapping table
+  // ============================================================
+
   inline static std::unordered_map<std::string, std::string> TirOps2NpuirOps = {
-    {"tir.exp", "tl.npuir_exp"},
-    {"tir.fabs", "tl.npuir_abs"},
-    {"tir.sigmoid", "tl.npuir_sigmoid"},
-    {"tir.if_then_else", "tl.npuir_select"},
-    {"Add", "tl.npuir_add"},
-    {"Mul", "tl.npuir_mul"},
-    {"Sub", "tl.npuir_sub"},
-    {"Div", "tl.npuir_div"},
-    {"EQ", "tl.npuir_cmp"},
-    {"NE", "tl.npuir_cmp"},
-    {"LT", "tl.npuir_cmp"},
-    {"LE", "tl.npuir_cmp"},
-    {"GE", "tl.npuir_cmp"},
-    {"GT", "tl.npuir_cmp"},
-    {"Copy", "tl.copy"},
-    {"Broadcast", "tl.npuir_brc"},
+      {"tir.exp", "tl.npuir_exp"},     {"tir.fabs", "tl.npuir_abs"},
+      {"tir.log", "tl.npuir_ln"},      {"tir.sqrt", "tl.npuir_sqrt"},
+      {"tir.rsqrt", "tl.npuir_rsqrt"}, {"tir.sigmoid", "tl.npuir_sigmoid"},
+      {"Cast", "tl.npuir_cast"},       {"tir.if_then_else", "tl.npuir_select"},
+      {"Add", "tl.npuir_add"},         {"Mul", "tl.npuir_mul"},
+      {"Sub", "tl.npuir_sub"},         {"Div", "tl.npuir_div"},
+      {"Min", "tl.npuir_min"},         {"Max", "tl.npuir_max"},
+      {"EQ", "tl.npuir_cmp"},          {"NE", "tl.npuir_cmp"},
+      {"LT", "tl.npuir_cmp"},          {"LE", "tl.npuir_cmp"},
+      {"GE", "tl.npuir_cmp"},          {"GT", "tl.npuir_cmp"},
+      {"Broadcast", "tl.npuir_brc"},   {"Copy", "tl.copy"},
   };
 
-  bool IsCmpOps(const std::string& op_name) {
-    return op_name == "EQ" ||
-           op_name == "NE" ||
-           op_name == "LT" ||
-           op_name == "GT" ||
-           op_name == "LE" ||
-           op_name == "GE";
+  // ============================================================
+  // RAII depth management: prevents forgetting to reset depth to 0 on return.
+  // ============================================================
+
+  struct DepthGuard {
+    int &depth;
+    bool committed = false;
+
+    explicit DepthGuard(int &d) : depth(d) { depth++; }
+
+    // Call when the operation completes successfully; decrements depth.
+    void commit() {
+      depth--;
+      committed = true;
+    }
+
+    // If commit() was never called (i.e. an early failure occurred), reset
+    // depth to 0.
+    ~DepthGuard() {
+      if (!committed)
+        depth = 0;
+    }
+  };
+
+  // ============================================================
+  // Basic utility functions
+  // ============================================================
+
+  bool IsCmpOp(const std::string &op) {
+    static const std::unordered_set<std::string> cmp_ops = {"EQ", "NE", "LT",
+                                                            "GT", "LE", "GE"};
+    return cmp_ops.count(op);
   }
+
+  bool IsFloat16Or32(const DataType &dtype) {
+    return dtype.is_float() && (dtype.bits() == 16 || dtype.bits() == 32);
+  }
+
+  bool IsNpuirDivDtypeSupported(const DataType &dtype) {
+    return IsFloat16Or32(dtype) || (dtype.is_int() && dtype.bits() == 64);
+  }
+
+  bool CanLowerBinaryOpToNpuir(const std::string &op_name,
+                               const DataType &result_dtype) {
+    if (op_name == "Div" || op_name == "FloorDiv" || op_name == "FloorMod") {
+      // Reject dtypes that vdiv cannot lower before floor ops expand.
+      // Example: int32 x % y would become vdiv/vmul/vsub on int32 buffers.
+      return IsNpuirDivDtypeSupported(result_dtype);
+    }
+    return true;
+  }
+
+  bool IsScalar(const PrimExpr &expr) {
+    return expr.as<IntImmNode>() || expr.as<FloatImmNode>();
+  }
+
+  bool UsesLoopVar(const PrimExpr &expr, const VarNode *loop_var) {
+    return tir::UsesVar(expr,
+                        [loop_var](const VarNode *v) { return v == loop_var; });
+  }
+
+  bool ContainsAnyLoopVar(const PrimExpr &expr,
+                          const std::vector<const VarNode *> &loop_vars) {
+    for (auto lv : loop_vars) {
+      if (UsesLoopVar(expr, lv))
+        return true;
+    }
+    return false;
+  }
+
+  int FindMappedLoopVar(const PrimExpr &expr,
+                        const std::vector<const VarNode *> &loop_vars) {
+    int mapped = -1;
+    for (int i = 0; i < static_cast<int>(loop_vars.size()); ++i) {
+      if (!UsesLoopVar(expr, loop_vars[i]))
+        continue;
+      if (mapped != -1)
+        return -2;
+      mapped = i;
+    }
+    return mapped;
+  }
+
+  bool IsLoopInvariant(const Array<PrimExpr> &indices,
+                       const std::vector<const VarNode *> &loop_vars) {
+    for (const auto &idx : indices) {
+      if (ContainsAnyLoopVar(idx, loop_vars))
+        return false;
+    }
+    return true;
+  }
+
+  bool
+  IsLoopInvariantScalarLike(const PrimExpr &expr,
+                            const std::vector<const VarNode *> &loop_vars) {
+    if (IsScalar(expr))
+      return true;
+    if (auto var = expr.as<VarNode>()) {
+      for (auto lv : loop_vars)
+        if (lv == var)
+          return false;
+      return true;
+    }
+    if (auto load = expr.as<BufferLoadNode>())
+      return IsLoopInvariant(load->indices, loop_vars);
+    return false;
+  }
+
+  bool ValidBufferIndices(const Array<PrimExpr> &indices) {
+    for (const auto &idx : indices) {
+      if (!idx.dtype().is_int())
+        return false;
+    }
+    return true;
+  }
+
+  // Simplify a PrimExpr with a fresh arithmetic analyzer so later shape/index
+  // checks can reason about a canonicalized form instead of the original
+  // syntax.
+  PrimExpr SimplifyExpr(const PrimExpr &expr) {
+    arith::Analyzer analyzer;
+    return analyzer.Simplify(expr);
+  }
+
+  bool IsLoopInvariantExpr(const PrimExpr &expr,
+                           const std::vector<const VarNode *> &loop_vars) {
+    return !ContainsAnyLoopVar(expr, loop_vars);
+  }
+
+  // Accept loop_var, loop_var +/- invariant, and invariant + loop_var.
+  // This is the unit-stride subset that remains a linear contiguous access.
+  bool IsUnitStrideLoopIndex(const PrimExpr &expr, const VarNode *loop_var,
+                             const std::vector<const VarNode *> &loop_vars) {
+    if (auto var = expr.as<VarNode>())
+      return var == loop_var;
+    if (auto cast = expr.as<CastNode>())
+      return IsUnitStrideLoopIndex(cast->value, loop_var, loop_vars);
+    if (auto add = expr.as<AddNode>()) {
+      return (IsUnitStrideLoopIndex(add->a, loop_var, loop_vars) &&
+              IsLoopInvariantExpr(add->b, loop_vars)) ||
+             (IsLoopInvariantExpr(add->a, loop_vars) &&
+              IsUnitStrideLoopIndex(add->b, loop_var, loop_vars));
+    }
+    if (auto sub = expr.as<SubNode>()) {
+      return IsUnitStrideLoopIndex(sub->a, loop_var, loop_vars) &&
+             IsLoopInvariantExpr(sub->b, loop_vars);
+    }
+    return false;
+  }
+
+  // A BufferLoad index is supported when simplification turns it into either
+  // a loop-invariant expression or a single-loop-var unit-stride expression.
+  bool IsSupportedVectorLoadIndex(const PrimExpr &expr,
+                                  const std::vector<const VarNode *> &loop_vars,
+                                  PrimExpr *simplified_out = nullptr) {
+    PrimExpr simplified = SimplifyExpr(expr);
+    if (simplified_out)
+      *simplified_out = simplified;
+
+    if (IsLoopInvariantExpr(simplified, loop_vars))
+      return true;
+
+    int mapped = FindMappedLoopVar(simplified, loop_vars);
+    if (mapped < 0)
+      return false;
+    return IsUnitStrideLoopIndex(simplified, loop_vars[mapped], loop_vars);
+  }
+
+  // ============================================================
+  // Op type predicates
+  // ============================================================
+
+  bool IsUnaryOp(const PrimExpr &expr) {
+    if (expr.as<CastNode>())
+      return true;
+    if (auto call = expr.as<CallNode>()) {
+      if (auto op = call->op.as<OpNode>()) {
+        return op->name == "tir.exp" || op->name == "tir.fabs" ||
+               op->name == "tir.log" || op->name == "tir.sqrt" ||
+               op->name == "tir.rsqrt" || op->name == "tir.sigmoid";
+      }
+    }
+    return false;
+  }
+
+  bool IsBinaryOp(const PrimExpr &expr, std::string *op_type,
+                  Array<PrimExpr> *operands) {
+#define HANDLE_BINARY_OP(NodeType, OpName)                                     \
+  if (auto node = expr.as<NodeType>()) {                                       \
+    if (op_type)                                                               \
+      *op_type = OpName;                                                       \
+    if (operands) {                                                            \
+      operands->push_back(node->a);                                            \
+      operands->push_back(node->b);                                            \
+    }                                                                          \
+    return true;                                                               \
+  }
+    HANDLE_BINARY_OP(AddNode, "Add")
+    HANDLE_BINARY_OP(MulNode, "Mul")
+    HANDLE_BINARY_OP(SubNode, "Sub")
+    HANDLE_BINARY_OP(DivNode, "Div")
+    HANDLE_BINARY_OP(FloorDivNode, "FloorDiv")
+    HANDLE_BINARY_OP(FloorModNode, "FloorMod")
+    HANDLE_BINARY_OP(MinNode, "Min")
+    HANDLE_BINARY_OP(MaxNode, "Max")
+    HANDLE_BINARY_OP(LTNode, "LT")
+    HANDLE_BINARY_OP(LENode, "LE")
+    HANDLE_BINARY_OP(GENode, "GE")
+    HANDLE_BINARY_OP(GTNode, "GT")
+    HANDLE_BINARY_OP(EQNode, "EQ")
+    HANDLE_BINARY_OP(NENode, "NE")
+#undef HANDLE_BINARY_OP
+    return false;
+  }
+
+  bool IsTernaryOp(const PrimExpr &expr) {
+    if (auto call = expr.as<CallNode>()) {
+      if (auto op = call->op.as<OpNode>())
+        return op->name == "tir.if_then_else";
+    }
+    return false;
+  }
+
+  // ============================================================
+  // Buffer management
+  // ============================================================
 
   struct BufferAccessInfo {
     Buffer buffer;
     Array<PrimExpr> indices;
-    bool is_load;  // true for BufferLoad, false for BufferStore
+    bool is_load = true;
   };
 
-  inline BufferAccessInfo ExtractBufferAccessInfo(const ObjectRef& node) {
-    BufferAccessInfo info;
+  BufferAccessInfo ExtractBufferAccessInfo(const ObjectRef &node) {
+    if (auto load = node.as<BufferLoadNode>())
+      return {load->buffer, load->indices, true};
+    if (auto store = node.as<BufferStoreNode>())
+      return {store->buffer, store->indices, false};
+    LOG(FATAL) << "Expected BufferLoad or BufferStore, got: "
+               << node->GetTypeKey();
+    return {};
+  }
 
-    if (auto load = node.as<BufferLoadNode>()) {
-      info.buffer = load->buffer;
-      info.indices = load->indices;
-      info.is_load = true;
-    } else if (auto store = node.as<BufferStoreNode>()) {
-      info.buffer = store->buffer;
-      info.indices = store->indices;
-      info.is_load = false;
-    } else {
-      LOG(FATAL) << "Expected BufferLoad or BufferStore, but got: "
-                 << node->GetTypeKey();
+  // Create a named buffer with the specified shape / scope / dtype.
+  Buffer CreateTempBufferWithShape(const Array<PrimExpr> &shape, DataType dtype,
+                                   const std::string &name,
+                                   const std::string &scope,
+                                   const std::string &op_name = "") {
+    DataType actual_dtype =
+        (!op_name.empty() && IsCmpOp(op_name)) ? DataType::Bool() : dtype;
+    Var buf_var(name, PointerType(PrimType(actual_dtype), scope));
+    return Buffer(buf_var, dtype, shape, {}, PrimExpr(0), name, 0, 0, kDefault);
+  }
+
+  std::string NextTempBufferName(const std::string &prefix = "tmp") {
+    static int tmp_id = 0;
+    return prefix + "_" + std::to_string(tmp_id++) + "_buf";
+  }
+
+  // Create a temporary buffer with the same shape / scope as the reference
+  // BufferAccessInfo and register it in tmp_buffers.
+  BufferAccessInfo CreateTempBuffer(const BufferAccessInfo &ref,
+                                    const std::string &op_name = "npuir_add") {
+    const Buffer &ref_buf = ref.buffer;
+    DataType dtype = IsCmpOp(op_name) ? DataType::Bool() : ref_buf->dtype;
+    std::string name = NextTempBufferName();
+    Buffer buf(Var(name, PointerType(PrimType(dtype), ref_buf.scope())), dtype,
+               ref_buf->shape, {}, PrimExpr(0), name, 0, 0, kDefault);
+    tmp_buffers.push_back(buf);
+    return {buf, ref.indices, true};
+  }
+
+  // ============================================================
+  // Region construction
+  // ============================================================
+
+  // Build a region call where every dimension uses the same integer size.
+  PrimExpr BuildRegionCall(const BufferAccessInfo &info, int region_id,
+                           int size) {
+    PrimExpr load = BufferLoad(info.buffer, info.indices);
+    Array<PrimExpr> args = {load, make_const(DataType::Int(32), region_id)};
+    for (size_t i = 0; i < info.indices.size(); ++i)
+      args.push_back(make_const(DataType::Int(32), size));
+    return Call(DataType::Handle(), Op::Get("tl.region"), args);
+  }
+
+  // Build a region call with explicitly specified offsets and sizes.
+  PrimExpr RegionND(Buffer buf, const std::vector<PrimExpr> &offsets,
+                    int region_id, const std::vector<int64_t> &sizes) {
+    ICHECK_EQ(buf->shape.size(), offsets.size())
+        << "RegionND dimension mismatch";
+    Array<PrimExpr> args = {
+        BufferLoad(buf, Array<PrimExpr>(offsets.begin(), offsets.end())),
+        make_const(DataType::Int(32), region_id)};
+    for (auto s : sizes)
+      args.push_back(make_const(DataType::Int(32), s));
+    return Call(DataType::Handle(), Op::Get("tl.region"), args);
+  }
+
+  std::vector<PrimExpr> MakeZeroOffsets(int n) {
+    std::vector<PrimExpr> v;
+    v.reserve(n);
+    for (int i = 0; i < n; i++)
+      v.push_back(make_const(DataType::Int(32), 0));
+    return v;
+  }
+
+  Array<PrimExpr> ToShapeExpr(const std::vector<int64_t> &shape) {
+    Array<PrimExpr> arr;
+    for (auto v : shape)
+      arr.push_back(make_const(DataType::Int(32), v));
+    return arr;
+  }
+
+  std::vector<int64_t>
+  GetAlignedLoopShape(const BufferAccessInfo &ref,
+                      const std::vector<const VarNode *> &loop_vars,
+                      const std::vector<int64_t> &loop_extents) {
+    int ndim = ref.indices.size();
+    std::vector<int64_t> shape(ndim, 1);
+    for (int i = 0; i < ndim; ++i) {
+      int mapped = FindMappedLoopVar(ref.indices[i], loop_vars);
+      if (mapped >= 0)
+        shape[i] = loop_extents[mapped];
     }
+    return shape;
+  }
+
+  // ============================================================
+  // NPUIR instruction construction
+  // ============================================================
+
+  // Append a lowercase mode string argument for comparison operators.
+  void AppendCmpMode(const std::string &op_name, Array<PrimExpr> &args) {
+    if (!IsCmpOp(op_name))
+      return;
+    std::string lower = op_name;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    args.push_back(StringImm(lower));
+  }
+
+  Stmt BuildNpuirCall(const std::string &op_name, Array<PrimExpr> args) {
+    AppendCmpMode(op_name, args);
+    return Evaluate(
+        Call(DataType::Void(), Op::Get(TirOps2NpuirOps.at(op_name)), args));
+  }
+
+  // Unary: region_in -> out
+  Stmt BuildUnaryStmt(const std::string &op_name, const PrimExpr &region_in,
+                      const BufferAccessInfo &out) {
+    if (op_name == "Cast") {
+      // Parallel cast lowering currently uses the default npuir round mode.
+      // CastNode itself does not carry alternative floor/trunc round metadata
+      // here.
+      return BuildNpuirCall(
+          op_name, {region_in, BuildRegionCall(out, 2, 1), StringImm("rint")});
+    }
+    return BuildNpuirCall(op_name, {region_in, BuildRegionCall(out, 2, 1)});
+  }
+
+  // Binary: a op b -> out; a/b are already region or scalar PrimExpr values.
+  Stmt BuildBinaryStmt(const std::string &op_name, const PrimExpr &region_a,
+                       const PrimExpr &region_b, const BufferAccessInfo &out) {
+    return BuildNpuirCall(op_name,
+                          {region_a, region_b, BuildRegionCall(out, 2, 1)});
+  }
+
+  // Ternary: select(cond, true_buf, false_buf) -> out
+  Stmt BuildTernaryStmt(const std::string &op_name,
+                        const BufferAccessInfo &cond,
+                        const BufferAccessInfo &true_buf,
+                        const BufferAccessInfo &false_buf,
+                        const BufferAccessInfo &out) {
+    return BuildNpuirCall(op_name, {BuildRegionCall(cond, 1, 1),
+                                    BuildRegionCall(true_buf, 1, 1),
+                                    BuildRegionCall(false_buf, 1, 1),
+                                    BuildRegionCall(out, 2, 1)});
+  }
+
+  // ============================================================
+  // Reshape + Broadcast hoisting logic
+  // ============================================================
+
+  struct ReshapeBrcInfo {
+    bool needed = false;
+    // index_to_loop[i]: which loop level buffer dimension i maps to;
+    // -1 means loop-invariant.
+    std::vector<int> index_to_loop;
+    // Copy/reshape source sizes aligned to buffer dimensions
+    // (loop-invariant axes are filled with 1).
+    std::vector<int64_t> src_sizes;
+    // Reshape target shape aligned to loop dimensions
+    // (unused loop axes are filled with 1).
+    std::vector<int64_t> view_shape;
+  };
+
+  ReshapeBrcInfo
+  CheckNeedsReshapeBrc(const BufferLoadNode *load,
+                       const std::vector<const VarNode *> &loop_vars,
+                       const std::vector<int64_t> &loop_extents, int out_ndim) {
+    ReshapeBrcInfo info;
+    int N = loop_vars.size();
+    info.index_to_loop.assign(load->indices.size(), -1);
+
+    for (int i = 0; i < (int)load->indices.size(); i++)
+      info.index_to_loop[i] = FindMappedLoopVar(load->indices[i], loop_vars);
+
+    std::set<int> used(info.index_to_loop.begin(), info.index_to_loop.end());
+    used.erase(-1);
+
+    // [MODIFIED] original: (used.size()==N || used.empty())
+    // added dim_mismatch to also trigger when buf has fewer dims than output
+    int buf_ndim = static_cast<int>(load->indices.size());
+    if (((int)used.size() == N || used.empty()) && buf_ndim >= out_ndim)
+      return info;
+
+    info.needed = true;
+
+    for (int i = 0; i < (int)load->indices.size(); i++) {
+      int lv = info.index_to_loop[i];
+      info.src_sizes.push_back(lv >= 0 ? loop_extents[lv] : 1);
+    }
+    for (int j = 0; j < N; j++)
+      info.view_shape.push_back(used.count(j) ? loop_extents[j] : 1);
 
     return info;
   }
 
-  PrimExpr BuildRegionCall(const BufferAccessInfo& buffer, int region_id, int size) {
-    PrimExpr buffer_load = BufferLoad(buffer.buffer, buffer.indices);
-    std::vector<PrimExpr> args_vec = {
-      buffer_load,
-      make_const(DataType::Int(32), region_id),
-    };
-    for (int i = 0; i < buffer.indices.size(); ++i) {
-      args_vec.push_back(size);
-    }
-    Op region_op = Op::Get("tl.region");
-    return Call(DataType::Handle(), region_op, {args_vec});
-  }
+  // Emit copy -> reshape -> brc statements into hoisted_stmts_.
+  // Returns a BufferAccessInfo pointing to brc_buf whose indices are
+  // aligned with output_ref.
+  BufferAccessInfo
+  EmitReshapeAndBroadcast(const BufferLoadNode *load, const ReshapeBrcInfo &rbi,
+                          const BufferAccessInfo &output_ref,
+                          const std::vector<const VarNode *> &loop_vars,
+                          const std::vector<int64_t> &loop_extents,
+                          const std::string &op_name = "") {
+    int N = loop_extents.size();
+    const std::string scope = output_ref.buffer.scope();
 
-  BufferAccessInfo CreateTempBuffer(const BufferAccessInfo& output_buffer, std::string op_name = "npuir_add") {
-    static int tmp_id = 0;
-    Buffer ref = output_buffer.buffer;
-    DataType dtype = ref->dtype;
-    auto scope = ref.scope();
-    int64_t size = 1;
-    for (const auto& dim : ref->shape) {
-      if (auto imm = dim.as<IntImmNode>()) {
-        size *= imm->value;
-      } else {
-        LOG(FATAL) << "Can not create temporary buffer for dynamic shape.";
-        BufferAccessInfo info {Buffer()};
-        return info;
+    // Helper: generate a vector of N zero offsets.
+    auto make_zero_offsets = [](int n) {
+      std::vector<PrimExpr> v;
+      v.reserve(n);
+      for (int i = 0; i < n; i++)
+        v.push_back(make_const(DataType::Int(32), 0));
+      return v;
+    };
+
+    // Helper: convert an int64 vector to Array<PrimExpr>.
+    auto to_shape_expr = [](const std::vector<int64_t> &s) {
+      Array<PrimExpr> arr;
+      for (auto v : s)
+        arr.push_back(make_const(DataType::Int(32), v));
+      return arr;
+    };
+
+    // 1. local_buf: copy from the original buffer into a local-scope buffer.
+    Buffer local_buf =
+        CreateTempBufferWithShape(ToShapeExpr(rbi.src_sizes),
+                                  load->buffer->dtype, "local_src_buf", scope);
+    tmp_buffers.push_back(local_buf);
+
+    std::vector<PrimExpr> src_offsets;
+    src_offsets.reserve(load->indices.size());
+    for (int i = 0; i < (int)load->indices.size(); i++)
+      src_offsets.push_back(rbi.index_to_loop[i] >= 0
+                                ? make_const(DataType::Int(32), 0)
+                                : load->indices[i]);
+
+    auto local_offsets = MakeZeroOffsets((int)rbi.src_sizes.size());
+
+    hoisted_stmts_.push_back(
+        Evaluate(Call(DataType::Void(), Op::Get("tl.copy"),
+                      {RegionND(load->buffer, src_offsets, 1, rbi.src_sizes),
+                       RegionND(local_buf, local_offsets, 2, rbi.src_sizes)})));
+
+    // Build view_shape and brc_shape aligned to output_ref dimensionality.
+    int out_dim = output_ref.buffer->shape.size();
+    std::vector<int64_t> aligned_view_shape(out_dim, 1);
+    std::vector<int64_t> aligned_brc_shape(out_dim, 1);
+    for (int i = 0; i < out_dim; i++) {
+      if (auto var = output_ref.indices[i].as<VarNode>()) {
+        for (int j = 0; j < N; j++) {
+          if (loop_vars[j] == var) {
+            aligned_brc_shape[i] = loop_extents[j];
+            aligned_view_shape[i] = rbi.view_shape[j];
+            break;
+          }
+        }
       }
     }
 
-    std::string name = "tmp_" + std::to_string(tmp_id++) + "_buf";
-    Buffer buf;
-    if (!IsCmpOps(op_name)) {
-      buf = Buffer(
-        Var(name, PointerType(PrimType(dtype), scope)), 
-        dtype, ref->shape, {}, PrimExpr(0), name, 0, 0, kDefault
-      );
-    } else {
-      buf = Buffer(
-        Var(name, PointerType(PrimType(DataType::Bool()), scope)), 
-        DataType::Bool(), ref->shape, {}, PrimExpr(0), name, 0, 0, kDefault
-      );
+    // 2. view_buf: reshape local_buf to aligned_view_shape.
+    Buffer view_buf = CreateTempBufferWithShape(
+        to_shape_expr(aligned_view_shape), load->buffer->dtype,
+        "reshape_view_buf", scope);
+    tmp_buffers.push_back(view_buf);
+
+    auto view_offsets = MakeZeroOffsets(out_dim);
+
+    hoisted_stmts_.push_back(Evaluate(
+        Call(DataType::Void(), Op::Get("tl.npuir_reshape"),
+             {RegionND(local_buf, local_offsets, 1, rbi.src_sizes),
+              RegionND(view_buf, view_offsets, 2, aligned_view_shape)})));
+
+    // Check whether brc is actually needed: if view_shape already equals
+    // brc_shape in every dimension, the broadcast would be a no-op and the
+    // backend rejects it with "empty broadcast dims array".
+    // This happens when the buffer has fewer dims than output_ref but covers
+    // all loop vars (e.g. weight_buf(D,)[d_i] with out_buf(1,D)[0,d_i]:
+    // aligned_view_shape=[1,32], aligned_brc_shape=[1,32] -> no broadcast dim).
+    // In this case skip brc and return view_buf directly.
+    bool needs_brc = false;
+    for (int i = 0; i < out_dim; i++) {
+      if (aligned_brc_shape[i] != aligned_view_shape[i]) {
+        needs_brc = true;
+        break;
+      }
     }
 
-    tmp_buffers.push_back(buf);
-    BufferAccessInfo info {buf, output_buffer.indices};
-    return info;
+    if (!needs_brc) {
+      return {view_buf, output_ref.indices, true};
+    }
+
+    // 3. brc_buf: broadcast view_buf to aligned_brc_shape.
+    Buffer brc_buf = CreateTempBufferWithShape(ToShapeExpr(aligned_brc_shape),
+                                               load->buffer->dtype, "brc_buf",
+                                               scope, op_name);
+    tmp_buffers.push_back(brc_buf);
+
+    auto brc_offsets = MakeZeroOffsets(out_dim);
+    hoisted_stmts_.push_back(
+        Evaluate(Call(DataType::Void(), Op::Get("tl.npuir_brc"),
+                      {RegionND(view_buf, view_offsets, 1, aligned_view_shape),
+                       RegionND(brc_buf, brc_offsets, 2, aligned_brc_shape)})));
+
+    return {brc_buf, output_ref.indices, true};
   }
 
-  Stmt VisitStmt_(const BlockNode* op) override {
-    auto saved_buffers = std::move(tmp_buffers);
+  std::optional<BufferAccessInfo>
+  EmitLoopVarArange(const VarNode *loop_var, const BufferAccessInfo &output_ref,
+                    const std::vector<const VarNode *> &loop_vars,
+                    const std::vector<int64_t> &loop_extents) {
+    int loop_idx = -1;
+    for (int i = 0; i < static_cast<int>(loop_vars.size()); ++i) {
+      if (loop_vars[i] == loop_var) {
+        loop_idx = i;
+        break;
+      }
+    }
+    if (loop_idx < 0)
+      return std::nullopt;
 
+    std::vector<int64_t> aligned_shape =
+        GetAlignedLoopShape(output_ref, loop_vars, loop_extents);
+    Buffer arange_buf =
+        CreateTempBufferWithShape(ToShapeExpr(aligned_shape), DataType::Int(32),
+                                  "arange_buf", output_ref.buffer.scope());
+    tmp_buffers.push_back(arange_buf);
+
+    auto zero_offsets = MakeZeroOffsets(static_cast<int>(aligned_shape.size()));
+    Array<PrimExpr> args = {
+        RegionND(arange_buf, zero_offsets, 2, aligned_shape)};
+    for (int i = 0; i < static_cast<int>(output_ref.indices.size()); ++i) {
+      int mapped = FindMappedLoopVar(output_ref.indices[i], loop_vars);
+      args.push_back(make_const(DataType::Int(32), mapped == loop_idx ? 1 : 0));
+    }
+
+    PrimExpr offset = loop_idx < static_cast<int>(current_loop_mins_.size())
+                          ? current_loop_mins_[loop_idx]
+                          : make_const(DataType::Int(32), 0);
+    args.push_back(offset);
+    hoisted_stmts_.push_back(
+        Evaluate(Call(DataType::Void(), Op::Get("tl.npuir_arange"), args)));
+    return BufferAccessInfo{arange_buf, output_ref.indices, true};
+  }
+
+  // ============================================================
+  // Unified operand resolution
+  // ============================================================
+
+  // Resolve an operand into either a scalar-like expression or a vector source.
+  std::optional<BufferAccessInfo>
+  ResolveOperand(const PrimExpr &operand, const BufferAccessInfo &output_ref,
+                 std::vector<BufferAccessInfo> *tmp_bufs,
+                 const std::vector<const VarNode *> &loop_vars,
+                 const std::vector<int64_t> &loop_extents, Array<Stmt> *stmts,
+                 const std::string &op_name = "") {
+
+    // Keep loop-invariant operands as scalar expressions.
+    if (IsLoopInvariantScalarLike(operand, loop_vars))
+      return std::nullopt;
+
+    // Materialize the loop var into a temporary buffer via tl.npuir_arange.
+    if (auto var = operand.as<VarNode>()) {
+      auto materialized =
+          EmitLoopVarArange(var, output_ref, loop_vars, loop_extents);
+      if (materialized) {
+        tmp_bufs->push_back(*materialized);
+        return materialized;
+      }
+      return std::nullopt;
+    }
+
+    // Simplify BufferLoad indices first, then reuse the normal load/reshape
+    // path.
+    if (auto load = operand.as<BufferLoadNode>()) {
+      if (!ValidBufferIndices(load->indices))
+        return std::nullopt;
+
+      Array<PrimExpr> simplified_indices;
+      for (const auto &idx : load->indices) {
+        PrimExpr simplified_idx;
+        if (!IsSupportedVectorLoadIndex(idx, loop_vars, &simplified_idx))
+          return std::nullopt;
+        simplified_indices.push_back(simplified_idx);
+      }
+
+      BufferLoad simplified_load(load->buffer, simplified_indices);
+      auto rbi =
+          CheckNeedsReshapeBrc(simplified_load.as<BufferLoadNode>(), loop_vars,
+                               loop_extents, (int)output_ref.indices.size());
+      if (rbi.needed) {
+        auto expanded = EmitReshapeAndBroadcast(
+            simplified_load.as<BufferLoadNode>(), rbi, output_ref, loop_vars,
+            loop_extents, op_name);
+        tmp_bufs->push_back(expanded);
+        return expanded;
+      }
+      return BufferAccessInfo{load->buffer, simplified_indices, true};
+    }
+
+    // Complex sub-expression: decompose recursively; result lands in the
+    // most recently added tmp_buf.
+    if (!DecomposeExpression(operand, output_ref, tmp_bufs, loop_vars,
+                             loop_extents, stmts))
+      return std::nullopt;
+    // if conditon is complex expression of scalars, such as scalar_a < scalar_b
+    // it doesn't generate tmp buffer, so the tmp_bufs may be empty
+    if (tmp_bufs->empty())
+      return std::nullopt;
+    return tmp_bufs->back();
+  }
+
+  // ============================================================
+  // Expression decomposition
+  // ============================================================
+
+  bool HandleUnaryExpression(const PrimExpr &expr,
+                             const BufferAccessInfo &output_ref,
+                             std::vector<BufferAccessInfo> *tmp_bufs,
+                             const std::vector<const VarNode *> &loop_vars,
+                             const std::vector<int64_t> &loop_extents,
+                             Array<Stmt> *stmts) {
+    DepthGuard guard(depth);
+
+    PrimExpr operand;
+    std::string op_name;
+    if (auto *cast = expr.as<CastNode>()) {
+      op_name = "Cast";
+      operand = cast->value;
+
+      if (auto load = operand.as<BufferLoadNode>()) {
+        if (load->indices.size() != output_ref.indices.size()) {
+          // Keep rank-mismatched Cast expressions on the scalar fallback path.
+          // Vector VCast requires UB regions with compatible rank/alignment;
+          // short slices such as [1, 4] -> [4] can fault at runtime.
+          return false;
+        }
+      }
+
+      std::ostringstream os;
+      os << expr;
+      static std::unordered_set<std::string> warned_parallel_cast_exprs;
+      std::string expr_str = os.str();
+      if (warned_parallel_cast_exprs.insert(expr_str).second) {
+        LOG(WARNING) << "Parallel cast lowering uses fixed round mode 'rint'; "
+                     << "non-default floor/trunc cast expectations are not "
+                        "preserved for cast expr: "
+                     << expr_str;
+      }
+    } else {
+      auto *call = expr.as<CallNode>();
+      op_name = call->op.as<OpNode>()->name;
+      operand = call->args[0];
+    }
+
+    auto resolved = ResolveOperand(operand, output_ref, tmp_bufs, loop_vars,
+                                   loop_extents, stmts, op_name);
+    if (!resolved)
+      return false;
+
+    // depth > 1 means this is an intermediate sub-expression; store the
+    // result in a temporary buffer.
+    BufferAccessInfo output = output_ref;
+    if (depth > 1) {
+      std::string name = NextTempBufferName();
+      Buffer buf(Var(name, PointerType(PrimType(expr.dtype()),
+                                       resolved->buffer.scope())),
+                 expr.dtype(), resolved->buffer->shape, {}, PrimExpr(0), name,
+                 0, 0, kDefault);
+      tmp_buffers.push_back(buf);
+      output = {buf, resolved->indices, true};
+      tmp_bufs->push_back(output);
+    }
+
+    stmts->push_back(
+        BuildUnaryStmt(op_name, BuildRegionCall(*resolved, 1, 1), output));
+    guard.commit();
+    return true;
+  }
+
+  bool HandleBinaryExpression(std::string op_name,
+                              const Array<PrimExpr> &operands,
+                              const DataType &result_dtype,
+                              const BufferAccessInfo &output_ref,
+                              std::vector<BufferAccessInfo> *tmp_bufs,
+                              const std::vector<const VarNode *> &loop_vars,
+                              const std::vector<int64_t> &loop_extents,
+                              Array<Stmt> *stmts) {
+    DepthGuard guard(depth);
+    if (!CanLowerBinaryOpToNpuir(op_name, result_dtype))
+      return false;
+
+    std::string resolve_op_name = op_name == "FloorDiv" ? "Div" : op_name;
+    auto resolved_a =
+        ResolveOperand(operands[0], output_ref, tmp_bufs, loop_vars,
+                       loop_extents, stmts, resolve_op_name);
+    auto resolved_b =
+        ResolveOperand(operands[1], output_ref, tmp_bufs, loop_vars,
+                       loop_extents, stmts, resolve_op_name);
+    // Both operands are scalar; cannot vectorize.
+    if (!resolved_a && !resolved_b)
+      return false;
+
+    PrimExpr region_a =
+        resolved_a ? BuildRegionCall(*resolved_a, 1, 1) : operands[0];
+    PrimExpr region_b =
+        resolved_b ? BuildRegionCall(*resolved_b, 1, 1) : operands[1];
+    std::string binary_op_name = resolve_op_name;
+
+    if (!resolved_a) {
+      if (binary_op_name == "Add" || binary_op_name == "Mul" ||
+          binary_op_name == "Min" || binary_op_name == "Max" ||
+          IsCmpOp(binary_op_name)) {
+        if (binary_op_name == "LT")
+          binary_op_name = "GT";
+        if (binary_op_name == "LE")
+          binary_op_name = "GE";
+        std::swap(region_a, region_b);
+      } else {
+        if (IsScalar(operands[0]) || operands[0].as<VarNode>()) {
+          region_a = operands[0];
+        } else {
+          // BufferLoad or compound expression: broadcast to tmp buffer.
+          const BufferAccessInfo &ref = *resolved_b;
+          auto scalar_buf = CreateTempBuffer(ref, binary_op_name);
+          tmp_bufs->push_back(scalar_buf);
+          stmts->push_back(BuildNpuirCall(
+              "Broadcast", {operands[0], BuildRegionCall(scalar_buf, 2, 1)}));
+          region_a = BuildRegionCall(scalar_buf, 1, 1);
+        }
+      }
+    }
+
+    if (!resolved_b) {
+      if (IsScalar(operands[1]) || operands[1].as<VarNode>()) {
+        region_b = operands[1];
+      } else {
+        // BufferLoad or compound expression: broadcast to tmp buffer.
+        const BufferAccessInfo &ref = *resolved_a;
+        auto scalar_buf = CreateTempBuffer(ref, binary_op_name);
+        tmp_bufs->push_back(scalar_buf);
+        stmts->push_back(BuildNpuirCall(
+            "Broadcast", {operands[1], BuildRegionCall(scalar_buf, 2, 1)}));
+        region_b = BuildRegionCall(scalar_buf, 1, 1);
+      }
+    }
+
+    const BufferAccessInfo &ref = resolved_a ? *resolved_a : *resolved_b;
+
+    if (op_name == "FloorMod") {
+      auto quotient = CreateTempBuffer(ref, "Div");
+      tmp_bufs->push_back(quotient);
+      stmts->push_back(BuildBinaryStmt("Div", region_a, region_b, quotient));
+
+      auto product = CreateTempBuffer(ref, "Mul");
+      tmp_bufs->push_back(product);
+      stmts->push_back(BuildBinaryStmt("Mul", BuildRegionCall(quotient, 1, 1),
+                                       region_b, product));
+
+      BufferAccessInfo output = output_ref;
+      if (depth > 1) {
+        output = CreateTempBuffer(ref, "Sub");
+        tmp_bufs->push_back(output);
+      }
+      stmts->push_back(BuildBinaryStmt("Sub", region_a,
+                                       BuildRegionCall(product, 1, 1), output));
+      guard.commit();
+      return true;
+    }
+
+    BufferAccessInfo output = output_ref;
+    if (depth > 1) {
+      output = CreateTempBuffer(ref, binary_op_name);
+      tmp_bufs->push_back(output);
+    }
+    stmts->push_back(
+        BuildBinaryStmt(binary_op_name, region_a, region_b, output));
+    guard.commit();
+    return true;
+  }
+
+  bool HandleTernaryExpression(const PrimExpr &expr,
+                               const BufferAccessInfo &output_ref,
+                               std::vector<BufferAccessInfo> *tmp_bufs,
+                               const std::vector<const VarNode *> &loop_vars,
+                               const std::vector<int64_t> &loop_extents,
+                               Array<Stmt> *stmts) {
+    DepthGuard guard(depth);
+
+    auto *call = expr.as<CallNode>();
+    std::string op_name = call->op.as<OpNode>()->name;
+
+    auto ResolveTernaryOperand =
+        [&](const PrimExpr &e,
+            const std::string &tmp_op =
+                "npuir_add") -> std::optional<BufferAccessInfo> {
+      // Case 1: simple scalar (IntImm/FloatImm/VarNode/loop-invariant
+      // BufferLoad)
+      if (IsLoopInvariantScalarLike(e, loop_vars)) {
+        auto tmp = CreateTempBuffer(output_ref, tmp_op);
+        tmp_bufs->push_back(tmp);
+        stmts->push_back(BuildUnaryStmt("Broadcast", e, tmp));
+        return tmp;
+      }
+
+      // Case 2: try normal vectorization path
+      auto resolved = ResolveOperand(e, output_ref, tmp_bufs, loop_vars,
+                                     loop_extents, stmts, op_name);
+      if (resolved)
+        return resolved;
+
+      // Case 3: ResolveOperand failed - e is a pure scalar compound expression
+      // (e.g. `1 <= cid`, neither side contains a loop variable).
+      // Verify that e contains no loop variables before broadcasting.
+      bool contains_loop_var = false;
+      for (auto lv : loop_vars) {
+        if (tir::UsesVar(e, [lv](const VarNode *v) { return v == lv; })) {
+          contains_loop_var = true;
+          break;
+        }
+      }
+      if (!contains_loop_var) {
+        // Create a tmp buffer with the full output shape (e.g. 32x16).
+        auto tmp = CreateTempBuffer(output_ref, tmp_op);
+        tmp_bufs->push_back(tmp);
+
+        // Build a region with all-zero offsets and the full buffer shape,
+        // so the broadcast fills the entire buffer in one shot.
+        const Buffer &buf = tmp.buffer;
+        int ndim = buf->shape.size();
+        Array<PrimExpr> zero_indices;
+        for (int i = 0; i < ndim; i++)
+          zero_indices.push_back(make_const(DataType::Int(32), 0));
+
+        Array<PrimExpr> brc_args = {BufferLoad(buf, zero_indices),
+                                    make_const(DataType::Int(32), 2)};
+        for (const auto &s : buf->shape)
+          brc_args.push_back(s);
+
+        // Hoist the broadcast outside the loop so it executes once and
+        // fills the entire buffer.
+        hoisted_stmts_.push_back(Evaluate(Call(
+            DataType::Void(), Op::Get("tl.npuir_brc"),
+            {e, Call(DataType::Handle(), Op::Get("tl.region"), brc_args)})));
+
+        // Return all-zero indices so that subsequent BuildRegionCall
+        // generates the correct read region.
+        return BufferAccessInfo{buf, zero_indices, true};
+      }
+
+      return std::nullopt;
+    };
+
+    auto cond_info = ResolveTernaryOperand(call->args[0], "GT");
+    auto true_info = ResolveTernaryOperand(call->args[1]);
+    auto false_info = ResolveTernaryOperand(call->args[2]);
+
+    if (!cond_info || !true_info || !false_info)
+      return false;
+
+    stmts->push_back(BuildTernaryStmt(op_name, *cond_info, *true_info,
+                                      *false_info, output_ref));
+    guard.commit();
+    return true;
+  }
+
+  bool DecomposeExpression(const PrimExpr &expr,
+                           const BufferAccessInfo &output_ref,
+                           std::vector<BufferAccessInfo> *tmp_bufs,
+                           const std::vector<const VarNode *> &loop_vars,
+                           const std::vector<int64_t> &loop_extents,
+                           Array<Stmt> *stmts) {
+
+    if (expr.as<BufferLoadNode>()) {
+      DepthGuard guard(depth);
+      BufferAccessInfo src = ExtractBufferAccessInfo(expr);
+      stmts->push_back(
+          BuildNpuirCall("Copy", {BuildRegionCall(src, 1, 1),
+                                  BuildRegionCall(output_ref, 2, 1)}));
+      guard.commit();
+      return true;
+    }
+
+    if (expr.as<VarNode>()) {
+      DepthGuard guard(depth);
+      auto resolved = ResolveOperand(expr, output_ref, tmp_bufs, loop_vars,
+                                     loop_extents, stmts);
+      if (!resolved)
+        return false;
+      stmts->push_back(
+          BuildNpuirCall("Copy", {BuildRegionCall(*resolved, 1, 1),
+                                  BuildRegionCall(output_ref, 2, 1)}));
+      guard.commit();
+      return true;
+    }
+
+    if (IsLoopInvariantScalarLike(expr, loop_vars)) {
+      DepthGuard guard(depth);
+      stmts->push_back(BuildUnaryStmt("Broadcast", expr, output_ref));
+      guard.commit();
+      return true;
+    }
+
+    if (IsUnaryOp(expr))
+      return HandleUnaryExpression(expr, output_ref, tmp_bufs, loop_vars,
+                                   loop_extents, stmts);
+
+    std::string op_type;
+    Array<PrimExpr> operands;
+    if (IsBinaryOp(expr, &op_type, &operands))
+      return HandleBinaryExpression(op_type, operands, expr.dtype(), output_ref,
+                                    tmp_bufs, loop_vars, loop_extents, stmts);
+
+    if (IsTernaryOp(expr))
+      return HandleTernaryExpression(expr, output_ref, tmp_bufs, loop_vars,
+                                     loop_extents, stmts);
+
+    return false;
+  }
+
+  // ============================================================
+  // Loop structure collection
+  // ============================================================
+
+  struct LoopNest {
+    std::vector<const ForNode *> loops; // outer -> inner
+    const BufferStoreNode *store = nullptr;
+  };
+
+  // Collect consecutive parallel ForNodes starting from root until a
+  // BufferStore is encountered.
+  std::optional<LoopNest> CollectPerfectParallelNest(const ForNode *root) {
+    LoopNest nest;
+    Stmt cur = GetRef<Stmt>(root);
+    while (auto f = cur.as<ForNode>()) {
+      if (f->kind != ForKind::kParallel || !f->extent.as<IntImmNode>())
+        return std::nullopt;
+      nest.loops.push_back(f);
+      cur = f->body;
+    }
+    nest.store = cur.as<BufferStoreNode>();
+    if (!nest.store)
+      return std::nullopt;
+    return nest;
+  }
+
+  // ============================================================
+  // Single-statement vectorization
+  // ============================================================
+
+  Stmt VectorizeSingleStatement(const ForNode *op) {
+    const auto *store = op->body.as<BufferStoreNode>();
+
+    // Store indices must be variables or constants only.
+    for (const auto &idx : store->indices) {
+      if (!idx.as<VarNode>() && !IsScalar(idx))
+        return StmtMutator::VisitStmt_(op);
+    }
+
+    Array<Stmt> stmts;
+    std::vector<BufferAccessInfo> tmp_bufs;
+
+    // Vectorized statements are collected into stmts.
+    bool ok = DecomposeExpression(
+        store->value, ExtractBufferAccessInfo(op->body), &tmp_bufs,
+        current_loop_vars_, current_loop_extents_, &stmts);
+
+    if (!ok)
+      return StmtMutator::VisitStmt_(op);
+
+    return For(op->loop_var, op->min, op->extent, op->kind,
+               SeqStmt::Flatten(stmts), op->thread_binding, op->annotations);
+  }
+
+  // ============================================================
+  // StmtMutator overrides
+  // ============================================================
+
+  // Collect all temporary buffers allocated within the current block and
+  // register them in alloc_buffers.
+  Stmt VisitStmt_(const BlockNode *op) override {
+    auto saved = std::move(tmp_buffers);
     tmp_buffers.clear();
 
     Stmt new_body = VisitStmt(op->body);
 
     Array<Buffer> allocs = op->alloc_buffers;
-    for (const Buffer& buf : tmp_buffers) {
+    for (const auto &buf : tmp_buffers)
       allocs.push_back(buf);
-    }
+    tmp_buffers = std::move(saved);
 
-    tmp_buffers = std::move(saved_buffers);
-
-    if (allocs.same_as(op->alloc_buffers) && new_body.same_as(op->body)) {
+    if (allocs.same_as(op->alloc_buffers) && new_body.same_as(op->body))
       return GetRef<Stmt>(op);
-    }
 
-    return Block(
-      op->iter_vars, op->reads, op->writes,
-      op->name_hint, new_body, op->init, allocs
-    );
-  }
-
-
-  Stmt ReplaceForBody(const ForNode* op, const Array<Stmt>& statements) {
-    Stmt new_body = SeqStmt::Flatten(statements);
-
-    // replace for body with new body
-    return For(op->loop_var,
-               op->min,
-               op->extent,
-               op->kind,
-               new_body,
-               op->thread_binding,
-               op->annotations);
-  }
-
-  static char to_lowercase(unsigned char c)
-  {
-      return std::tolower(c);
-  }
- 
-
-  Stmt BuildNPUIRBinaryCall(std::string op_name,
-                            const BufferAccessInfo& buffer_a,
-                            const BufferAccessInfo& buffer_b,
-                            const BufferAccessInfo& buffer_c) {
-    PrimExpr region_a = BuildRegionCall(buffer_a, 1, 1);
-    PrimExpr region_b = BuildRegionCall(buffer_b, 1, 1);
-    PrimExpr region_c = BuildRegionCall(buffer_c, 2, 1);
-    auto op_type = Op::Get(TirOps2NpuirOps[op_name]);
-
-    Array<PrimExpr> args = {region_a, region_b, region_c};
-    if (IsCmpOps(op_name)) {
-      std::string str = op_name;
-      std::transform(str.cbegin(), str.cend(), str.begin(), to_lowercase);
-      StringImm cmp_mode(str);
-      args.push_back(cmp_mode);
-    }
-    PrimExpr call = Call(DataType::Void(), op_type, args);
-    return Evaluate(call);
-  }
-
-  Stmt BuildNPUIRBinaryCall(std::string op_name,
-                            const BufferAccessInfo& buffer_a,
-                            const PrimExpr& scalar_b,
-                            const BufferAccessInfo& buffer_c) {
-    PrimExpr region_a = BuildRegionCall(buffer_a, 1, 1);
-    PrimExpr region_c = BuildRegionCall(buffer_c, 2, 1);
-    auto op_type = Op::Get(TirOps2NpuirOps[op_name]);
-
-    Array<PrimExpr> args = {region_a, scalar_b, region_c};
-    if (IsCmpOps(op_name)) {
-      std::string str = op_name;
-      std::transform(str.cbegin(), str.cend(), str.begin(), to_lowercase);
-      StringImm cmp_mode(str);
-      args.push_back(cmp_mode);
-    }
-    PrimExpr call = Call(DataType::Void(), op_type, args);
-    return Evaluate(call);
-  }
-
-  Stmt BuildNPUIRBinaryCall(std::string op_name,
-                            const PrimExpr& scalar_a,
-                            const BufferAccessInfo& buffer_b,
-                            const BufferAccessInfo& buffer_c) {
-    PrimExpr region_b = BuildRegionCall(buffer_b, 1, 1);
-    PrimExpr region_c = BuildRegionCall(buffer_c, 2, 1);
-    auto op_type = Op::Get(TirOps2NpuirOps[op_name]);
-
-    Array<PrimExpr> args = {scalar_a, region_b, region_c};
-    if (IsCmpOps(op_name)) {
-      std::string str = op_name;
-      std::transform(str.cbegin(), str.cend(), str.begin(), to_lowercase);
-      StringImm cmp_mode(str);
-      args.push_back(cmp_mode);
-    }
-    PrimExpr call = Call(DataType::Void(), op_type, args);
-    return Evaluate(call);
-  }
-
-  Stmt BuildNpuirBinaryCall(std::string op_name, PrimExpr a, PrimExpr b, PrimExpr c) {
-    auto op_type = Op::Get(TirOps2NpuirOps[op_name]);
-    Array<PrimExpr> args = {a, b, c};
-    if (IsCmpOps(op_name)) {
-      std::string str = op_name;
-      std::transform(str.cbegin(), str.cend(), str.begin(), to_lowercase);
-      StringImm cmp_mode(str);
-      args.push_back(cmp_mode);
-    }
-    PrimExpr call = Call(DataType::Void(), op_type, args);
-    return Evaluate(call);
-  }
-
-  Stmt BuildNPUIRUnaryCall(std::string op_name, const PrimExpr& scalar, const BufferAccessInfo& buffer_out,
-                           int offset) {
-    PrimExpr offset_expr = {make_const(DataType::Int(32), offset)};
-    PrimExpr region_out = BuildRegionCall(buffer_out, 2, 1);
-    auto op_type = Op::Get(TirOps2NpuirOps[op_name]);
-
-    Array<PrimExpr> args = {scalar, region_out};
-    PrimExpr call = Call(DataType::Void(), op_type, args);
-    return Evaluate(call);
-  }
-
-  Stmt BuildNPUIRUnaryCall(std::string op_name, const BufferAccessInfo& buffer_in, const BufferAccessInfo& buffer_out,
-                           int offset) {
-    PrimExpr offset_expr = {make_const(DataType::Int(32), offset)};
-    PrimExpr region_in = BuildRegionCall(buffer_in, 1, 1);
-    PrimExpr region_out = BuildRegionCall(buffer_out, 2, 1);
-    auto op_type = Op::Get(TirOps2NpuirOps[op_name]);
-
-    Array<PrimExpr> args = {region_in, region_out};
-    PrimExpr call = Call(DataType::Void(), op_type, args);
-    return Evaluate(call);
-  }
-
-  bool IsCopyOp(const PrimExpr &expr, const std::vector<const VarNode *> &loop_vars) {
-    if (IsScalarLike(expr, loop_vars) || expr.as<BufferLoadNode>()) {
-      return true;
-    }
-    return false;
-  }
-
-  bool IsUnaryOp(const PrimExpr& expr) {
-    if (auto call = expr.as<CallNode>()) {
-      std::string op_name;
-
-      if (auto* op_ptr = call->op.as<OpNode>()) {
-        op_name = op_ptr->name;
-        if (op_name == "tir.exp" || op_name == "tir.fabs" || op_name == "tir.sigmoid") {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-
-  bool IsBinaryOp(const PrimExpr& expr, std::string* op_type, Array<PrimExpr>* operands) {
-  #define HANDLE_BINARY_OP(NodeType, OpName) \
-    if (auto node = expr.as<NodeType>()) { \
-      if (op_type) *op_type = OpName; \
-      if (operands) { \
-        operands->push_back(node->a); \
-        operands->push_back(node->b); \
-      } \
-      return true; \
-    }
-
-    HANDLE_BINARY_OP(AddNode, "Add");
-    HANDLE_BINARY_OP(MulNode, "Mul");
-    HANDLE_BINARY_OP(SubNode, "Sub");
-    HANDLE_BINARY_OP(DivNode, "Div");
-    HANDLE_BINARY_OP(LTNode, "LT");
-    HANDLE_BINARY_OP(LENode, "LE");
-    HANDLE_BINARY_OP(GENode, "GE");
-    HANDLE_BINARY_OP(GTNode, "GT");
-    HANDLE_BINARY_OP(EQNode, "EQ");
-    HANDLE_BINARY_OP(NENode, "NE");
-
-  #undef HANDLE_BINARY_OP
-    return false;
-  }
-
-  bool IsTernaryOp(const PrimExpr& expr) {
-    if (auto call = expr.as<CallNode>()) {
-      if (auto* op_ptr = call->op.as<OpNode>()) {
-        if (op_ptr->name == "tir.if_then_else") {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-
-  bool IsScalar(const PrimExpr& expr) {
-    return expr.as<IntImmNode>() || expr.as<FloatImmNode>();
-  }
-
-  bool IsLoopInvariant(const Array<PrimExpr>& indices,
-                       const std::vector<const VarNode*>& loop_vars) {
-    for (const auto& idx : indices) {
-      bool found = false;
-      PostOrderVisit(idx, [&](const ObjectRef& node) {
-        if (const VarNode* v = node.as<VarNode>()) {
-          if (std::find(loop_vars.begin(), loop_vars.end(), v) != loop_vars.end()) {
-            found = true;
-          }
-        }
-      });
-      if (found) return false;
-    }
-    return true;
-  }
-
-  bool IndicesSameAsLoopVars(const Array<PrimExpr>& indices,
-                             const std::vector<const VarNode*>& loop_vars) {
-    if (indices.size() != loop_vars.size()) {
-      return false;
-    }
-    for (int i = 0; i < indices.size(); i++) {
-      if (indices[i].as<VarNode>() != loop_vars[i]) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  bool ValidBufferIndices(const Array<PrimExpr>& indices) {
-    for (const auto& index : indices) {
-      // Case of constant int
-      if (const auto* int_imm = index.as<tir::IntImmNode>()) {
-        continue;
-      }
-
-      // Case of constant var
-      if (const auto* var = index.as<tir::VarNode>()) {
-        if (var->dtype.is_int()) {
-          continue;
-        }
-      }
-      return false;
-    }
-    return true;
-  }
-
-  bool IsScalarLike(const PrimExpr& expr,
-                    const std::vector<const VarNode*>& loop_vars) {
-    if (IsScalar(expr)) {
-      return true;
-    }
-
-    if (auto load = expr.as<BufferLoadNode>()) {
-      return IsLoopInvariant(load->indices, loop_vars);
-    }
-
-    return false;
-  }
-
-  bool HandleSimpleExpression(std::string op_name, const Array<PrimExpr>& operands,
-                              const BufferAccessInfo& output_buffer, std::vector<BufferAccessInfo>* tmp_bufs,
-                              const std::vector<const VarNode*>& loop_vars, Array<Stmt>* statements) {
-    bool a_is_scalar = IsScalar(operands[0]);
-    bool b_is_scalar = IsScalar(operands[1]);
-    bool a_is_buffer = operands[0]->IsInstance<BufferLoadNode>();
-    bool b_is_buffer = operands[1]->IsInstance<BufferLoadNode>();
-
-    PrimExpr region_a;
-    PrimExpr region_b;
-    PrimExpr region_c;
-
-    auto processOperand = [&](const PrimExpr& operand, bool is_scalar, bool is_buffer)
-      -> std::optional<PrimExpr> {
-      if (is_scalar) {
-        return operand;
-      } else if (is_buffer) {
-        auto load = operand.as<BufferLoadNode>();
-        if (ValidBufferIndices(load->indices)) {
-          return BuildRegionCall(ExtractBufferAccessInfo(operand), 1, 1);
-        }
-        depth = 0;
-        return std::nullopt;
-      } else {
-        depth = 0;
-        return std::nullopt;
-      }
-    };
-
-    if (auto result = processOperand(operands[0], a_is_scalar, a_is_buffer)) {
-        region_a = *result;
-    } else {
-        return false;
-    }
-    if (auto result = processOperand(operands[1], b_is_scalar, b_is_buffer)) {
-      region_b = *result;
-    } else {
-      return false;
-    }
-
-    BufferAccessInfo output = output_buffer;
-    if(depth > 1) {
-      auto load_node = a_is_buffer ? operands[0].as<BufferLoadNode>() : operands[1].as<BufferLoadNode>();
-      BufferAccessInfo info {load_node->buffer, load_node->indices};
-      output = CreateTempBuffer(info, op_name);
-      tmp_bufs->push_back(output);
-    }
-    region_c = BuildRegionCall(output, 2, 1);
-
-    Stmt stmt;
-    // For hivm.vadd/hivm.vmul/hivm.vcmp, it's operand at index 0 must be vector
-    if (a_is_scalar && (op_name == "Add" || op_name == "Mul" || IsCmpOps(op_name))) {
-      if (op_name == "LT") op_name = "GT";
-      if (op_name == "LE") op_name = "GE";
-      stmt = BuildNpuirBinaryCall(op_name, region_b, region_a, region_c);
-    } else {
-      stmt = BuildNpuirBinaryCall(op_name, region_a, region_b, region_c);
-    }
-
-    statements->push_back(stmt);
-    depth--;
-    return true;
-  }
-
-  bool HandleCopyExpression(const PrimExpr &expr, const BufferAccessInfo &output_buffer,
-                            const std::vector<const VarNode *> &loop_vars, Array<Stmt> *statements) {
-    if (IsScalarLike(expr, loop_vars)) {
-      // Copy a constant or a loop invariant var into output buffer
-      Stmt statement = BuildNPUIRUnaryCall("Broadcast", expr, output_buffer, 0);
-      statements->push_back(statement);
-      --depth;
-      return true;
-    } else if (expr.as<BufferLoadNode>()) {
-      // Copy from input buffer into output buffer
-      Stmt statement = BuildNPUIRUnaryCall("Copy", ExtractBufferAccessInfo(expr), output_buffer, 0);
-      statements->push_back(statement);
-      --depth;
-      return true;
-    }
-    return false;
-  }
-
-  bool HandleUnaryExpression(const PrimExpr& expr, const BufferAccessInfo& output_buffer, std::vector<BufferAccessInfo>* tmp_bufs,
-                             const std::vector<const VarNode*>& loop_vars, Array<Stmt>* statements) {
-    auto* call = expr.as<CallNode>();
-    auto* op_ptr = call->op.as<OpNode>();
-    std::string op_name = op_ptr->name;
-    BufferAccessInfo output = output_buffer;
-
-    if (auto load = call->args[0].as<BufferLoadNode>()) {
-      if (!ValidBufferIndices(load->indices)) {
-        depth = 0;
-        return false;
-      }
-      // If indices are consistent with loop vars, it means the address offset of the buffer is 0
-      int offset = 0;
-      if (depth > 1) {
-        output = CreateTempBuffer(output_buffer);
-        tmp_bufs->push_back(output);
-      }
-      Stmt statement = BuildNPUIRUnaryCall(op_name, ExtractBufferAccessInfo(call->args[0]), output, offset);
-      statements->push_back(statement);
-      depth--;
-      return true;
-    } else {
-      if (DecomposeExpression(call->args[0], output_buffer, tmp_bufs, loop_vars, statements)) {
-        int offset = 0;
-        auto last_buf = tmp_bufs->back();
-        if (depth > 1) {
-          output = CreateTempBuffer(last_buf);
-          tmp_bufs->push_back(output);
-        }
-        Stmt statement = BuildNPUIRUnaryCall(op_name, last_buf, output, offset);
-        statements->push_back(statement);
-        depth--;
-        return true;
-      }
-    }
-    depth = 0;
-    return false;
-  }
-
-  bool HandleBinaryExpression(std::string op_type, const Array<PrimExpr>& operands,
-                              const BufferAccessInfo& output_buffer, std::vector<BufferAccessInfo>* tmp_bufs,
-                              const std::vector<const VarNode*>& loop_vars, Array<Stmt>* statements) {
-    bool left_is_simple = operands[0].as<BufferLoadNode>() || IsScalarLike(operands[0], loop_vars);
-    bool right_is_simple = operands[1].as<BufferLoadNode>() || IsScalarLike(operands[1], loop_vars);
-    BufferAccessInfo output = output_buffer;
-
-    if (left_is_simple && right_is_simple) {
-      return HandleSimpleExpression(op_type, operands, output_buffer, tmp_bufs, loop_vars, statements);
-    } else if (!left_is_simple && right_is_simple) {
-      if (DecomposeExpression(operands[0], output_buffer, tmp_bufs, loop_vars, statements)) {
-        auto last_buf = tmp_bufs->back();
-        if (depth > 1) {
-          output = CreateTempBuffer(last_buf, op_type);
-          tmp_bufs->push_back(output);
-        }
-        Stmt statement;
-        if (IsScalar(operands[1])) {
-          if (op_type == "Add" || op_type == "Mul" || IsCmpOps(op_type)) {
-            statement = BuildNPUIRBinaryCall(op_type, last_buf, operands[1], output);
-          } else {
-            statement = BuildNPUIRBinaryCall(op_type, operands[1], last_buf, output);
-          }
-        } else {
-          statement = BuildNPUIRBinaryCall(op_type, last_buf, ExtractBufferAccessInfo(operands[1]), output);
-        }
-        statements->push_back(statement);
-        depth--;
-        return true;
-      }
-    } else if (left_is_simple && !right_is_simple) {
-      if (DecomposeExpression(operands[1], output_buffer, tmp_bufs, loop_vars, statements)) {
-        auto last_buf = tmp_bufs->back();
-        if (depth > 1) {
-          output = CreateTempBuffer(last_buf, op_type);
-          tmp_bufs->push_back(output);
-        }
-        Stmt statement;
-        if (IsScalar(operands[0])) {
-          if (op_type == "Add" || op_type == "Mul" || IsCmpOps(op_type)) {
-            if (op_type == "LT") op_type = "GT";
-            if (op_type == "LE") op_type = "GE";
-            statement = BuildNPUIRBinaryCall(op_type, last_buf, operands[0], output);
-          } else {
-            statement = BuildNPUIRBinaryCall(op_type, operands[0], last_buf, output);
-          }
-        } else {
-          statement = BuildNPUIRBinaryCall(op_type, ExtractBufferAccessInfo(operands[0]), last_buf, output);
-        }
-        statements->push_back(statement);
-        depth--;
-        return true;
-      }
-    } else if (!left_is_simple && !right_is_simple) {
-      if (!DecomposeExpression(operands[0], output_buffer, tmp_bufs, loop_vars, statements)) {
-        return false;
-      }
-      if (!DecomposeExpression(operands[1], output_buffer, tmp_bufs, loop_vars, statements)) {
-        return false;
-      }
-      auto right = tmp_bufs->back();
-      auto left = (*tmp_bufs)[tmp_bufs->size() - 2];
-      if (depth > 1) {
-        output = CreateTempBuffer(left, op_type);
-        tmp_bufs->push_back(output);
-      }
-
-      Stmt statement = BuildNPUIRBinaryCall(op_type, left, right, output);
-      statements->push_back(statement);
-      depth--;
-      return true;
-    }
-    depth = 0;
-    return false;
-  }
-
-  Stmt BuildNPUIRTernaryCall(std::string op_name,
-                             const BufferAccessInfo& cond_buf,
-                             const BufferAccessInfo& true_buf,
-                             const BufferAccessInfo& false_buf,
-                             const BufferAccessInfo& out_buf,
-                             int offset) {
-    PrimExpr offset_expr = {make_const(DataType::Int(32), offset)};
-    PrimExpr region_cond = BuildRegionCall(cond_buf, 1, 1);
-    PrimExpr region_true = BuildRegionCall(true_buf, 1, 1);
-    PrimExpr region_false = BuildRegionCall(false_buf, 1, 1);
-    PrimExpr region_out = BuildRegionCall(out_buf, 1, 1);
-    auto op_type = Op::Get(TirOps2NpuirOps[op_name]);
-
-    Array<PrimExpr> args = {region_cond, region_true, region_false, region_out};
-    PrimExpr call = Call(DataType::Void(), op_type, args);
-    return Evaluate(call);
-  }
-
-  bool HandleTernaryExpression(const PrimExpr& expr, const BufferAccessInfo& output_buffer, std::vector<BufferAccessInfo>* tmp_bufs,
-                             const std::vector<const VarNode*>& loop_vars, Array<Stmt>* statements) {
-    auto* call = expr.as<CallNode>();
-    auto* op_ptr = call->op.as<OpNode>();
-    std::string op_name = op_ptr->name;
-    BufferAccessInfo output = output_buffer;
-
-    PrimExpr cond_expr = call->args[0];
-    PrimExpr true_expr = call->args[1];
-    PrimExpr false_expr = call->args[2];
-
-    if (!DecomposeExpression(cond_expr, output_buffer, tmp_bufs, loop_vars, statements)) {
-      depth = 0;
-      return false;
-    }
-    BufferAccessInfo cond_buf = tmp_bufs->back();
-    BufferAccessInfo true_buf;
-    BufferAccessInfo false_buf;
-
-    auto processExpr = [&](const PrimExpr& val_expr, BufferAccessInfo& buf) {
-      if (val_expr.as<BufferLoadNode>()) {
-        buf = ExtractBufferAccessInfo(val_expr);
-      } else if (IsScalarLike(val_expr, loop_vars)) {
-        buf = CreateTempBuffer(output_buffer);
-        auto statement = BuildNPUIRUnaryCall("Broadcast", val_expr, buf, 0);
-        statements->push_back(statement);
-      } else {
-        if (!DecomposeExpression(val_expr, output_buffer, tmp_bufs, loop_vars, statements)) {
-          return false;
-        }
-        buf = tmp_bufs->back();
-      }
-      return true;
-    };
-    if (!processExpr(true_expr, true_buf)) {
-      depth = 0;
-      return false;
-    }
-    if (!processExpr(false_expr, false_buf)) {
-      depth = 0;
-      return false;
-    }
-    Stmt statement = BuildNPUIRTernaryCall(op_name, cond_buf, true_buf, false_buf, output, 0);
-    statements->push_back(statement);
-    depth--;
-    return true;
-  }
-
-  bool DecomposeExpression(const PrimExpr& expr, const BufferAccessInfo& output_buffer, std::vector<BufferAccessInfo>* tmp_bufs,
-                           const std::vector<const VarNode*>& loop_vars, Array<Stmt>* statements) {
-    if (IsCopyOp(expr, loop_vars)){
-      // Case of copy without computation
-      ++depth;
-      return HandleCopyExpression(expr, output_buffer, loop_vars, statements);
-    }
-
-    if (IsUnaryOp(expr)) {
-      depth++;
-      return HandleUnaryExpression(expr, output_buffer, tmp_bufs, loop_vars, statements);
-    }
-
-    std::string op_type;
-    Array<PrimExpr> operands;
-    if (IsBinaryOp(expr, &op_type, &operands)) {
-      depth++;
-      return HandleBinaryExpression(op_type, operands, output_buffer, tmp_bufs, loop_vars, statements);
-    }
-
-    if (IsTernaryOp(expr)) {
-      depth++;
-      return HandleTernaryExpression(expr, output_buffer, tmp_bufs, loop_vars, statements);
-    }
-
-    depth = 0;
-    return false;
-  }
-
-  Stmt VectorizeSingleStatement(const ForNode *op, int loop_count) {
-    const BufferStoreNode* store = op->body.as<BufferStoreNode>();
-    for (const auto& index : store->indices) {
-      const VarNode* var = index.as<VarNode>();
-      if (!var && !IsScalar(index)) {
-        return StmtMutator::VisitStmt_(op);
-      }
-    }
-
-    std::vector<const VarNode*> loop_vars;
-    loop_vars.push_back(op->loop_var.get());
-    Array<Stmt> statements;
-    std::vector<BufferAccessInfo> tmp_bufs;
-
-    bool ret = DecomposeExpression(store->value, ExtractBufferAccessInfo(op->body), &tmp_bufs, loop_vars, &statements);
-    return ret ? ReplaceForBody(op, statements) : StmtMutator::VisitStmt_(op);
+    return Block(op->iter_vars, op->reads, op->writes, op->name_hint, new_body,
+                 op->init, allocs);
   }
 
   Stmt VisitStmt_(const ForNode *op) final {
-    if (op->kind != ForKind::kParallel) {
+    if (op->kind != ForKind::kParallel)
       return StmtMutator::VisitStmt_(op);
-    }
 
-    const IntImmNode* loop_extent = op->extent.as<IntImmNode>();
-    if (!loop_extent) {
+    auto ext_imm = op->extent.as<IntImmNode>();
+    if (!ext_imm)
       return StmtMutator::VisitStmt_(op);
-    }
 
+    bool is_outermost = current_loop_vars_.empty();
+    current_loop_vars_.push_back(op->loop_var.get());
+    current_loop_extents_.push_back(ext_imm->value);
+    current_loop_mins_.push_back(op->min);
+
+    Stmt result;
     if (!op->body.as<BufferStoreNode>()) {
-      return StmtMutator::VisitStmt_(op);
+      // Nested loop: recursively process the body.
+      Stmt new_body = VisitStmt(op->body);
+      result = For(op->loop_var, op->min, op->extent, op->kind, new_body,
+                   op->thread_binding, op->annotations);
+    } else {
+      // Innermost loop: attempt vectorization.
+      result = VectorizeSingleStatement(op);
     }
 
-    auto vectorized = VectorizeSingleStatement(op, loop_extent->value);
-    if (vectorized.defined()) {
-      return vectorized;
+    current_loop_vars_.pop_back();
+    current_loop_extents_.pop_back();
+    current_loop_mins_.pop_back();
+
+    // After processing the outermost parallel loop, prepend all hoisted
+    // statements before it.
+    if (is_outermost && !hoisted_stmts_.empty()) {
+      Array<Stmt> all;
+      for (auto &s : hoisted_stmts_)
+        all.push_back(s);
+      all.push_back(result);
+      hoisted_stmts_.clear();
+      return SeqStmt::Flatten(all);
     }
-    return StmtMutator::VisitStmt_(op);
+
+    return result;
   }
 };
 
 class LoopVectorize : public StmtMutator {
 private:
   inline static std::unordered_set<std::string> CandidateVectorizationOps = {
-    "tl.copy",
-    "tl.npuir_exp",
-    "tl.npuir_abs",
-    "tl.npuir_add",
-    "tl.npuir_mul",
-    "tl.npuir_sub",
-    "tl.npuir_div",
-    "tl.npuir_sigmoid",
-    "tl.npuir_brc",
-    "tl.npuir_cmp",
-    "tl.npuir_select",
+      "tl.copy",       "tl.npuir_exp",  "tl.npuir_abs",   "tl.npuir_add",
+      "tl.npuir_mul",  "tl.npuir_sub",  "tl.npuir_div",   "tl.npuir_sigmoid",
+      "tl.npuir_ln",   "tl.npuir_sqrt", "tl.npuir_rsqrt", "tl.npuir_min",
+      "tl.npuir_max",  "tl.npuir_brc",  "tl.npuir_cmp",   "tl.npuir_select",
+      "tl.npuir_cast",
   };
 
-  bool IsScalar(const PrimExpr& expr) {
+  bool IsScalar(const PrimExpr &expr) {
     return expr.as<IntImmNode>() || expr.as<FloatImmNode>();
   }
 
   // return a integer if the input is able to be converted, else return null
-  std::optional<int64_t> TryGetConstIntValue(const tvm::PrimExpr& expr, tvm::arith::Analyzer* analyzer = nullptr) {
+  std::optional<int64_t>
+  TryGetConstIntValue(const tvm::PrimExpr &expr,
+                      tvm::arith::Analyzer *analyzer = nullptr) {
     // Method 1: Direct check for IntImmNode
-    if (const tvm::tir::IntImmNode* int_imm = expr.as<tvm::tir::IntImmNode>()) {
+    if (const tvm::tir::IntImmNode *int_imm = expr.as<tvm::tir::IntImmNode>()) {
       return int_imm->value;
     }
 
     // Method 2: Use arith::Analyzer for simplification
     tvm::arith::Analyzer local_analyzer;
-    tvm::arith::Analyzer* used_analyzer = analyzer ? analyzer : &local_analyzer;
+    tvm::arith::Analyzer *used_analyzer = analyzer ? analyzer : &local_analyzer;
 
     tvm::PrimExpr simplified = used_analyzer->Simplify(expr);
-    if (const tvm::tir::IntImmNode* simplified_int = simplified.as<tvm::tir::IntImmNode>()) {
+    if (const tvm::tir::IntImmNode *simplified_int =
+            simplified.as<tvm::tir::IntImmNode>()) {
       return simplified_int->value;
     }
 
@@ -788,7 +1199,7 @@ private:
     }
 
     // Method 4: Handle common expression patterns
-    if (const tvm::tir::SubNode* sub = expr.as<tvm::tir::SubNode>()) {
+    if (const tvm::tir::SubNode *sub = expr.as<tvm::tir::SubNode>()) {
       if (sub->a.same_as(sub->b)) {
         return 0;
       }
@@ -797,12 +1208,15 @@ private:
     return std::nullopt;
   }
 
-  // return a Call to tl.region -> str: T.region(buffer[offset_expr], region_id, size)
-  PrimExpr BuildRegionCall(Buffer buffer, const std::vector<PrimExpr>& offset_expr, int region_id, const std::vector<size_t>& size) {
+  // return a Call to tl.region -> str: T.region(buffer[offset_expr], region_id,
+  // size)
+  PrimExpr BuildRegionCall(Buffer buffer,
+                           const std::vector<PrimExpr> &offset_expr,
+                           int region_id, const std::vector<size_t> &size) {
     PrimExpr buffer_load = BufferLoad(buffer, {offset_expr});
     std::vector<PrimExpr> args_vec = {
-      buffer_load,
-      make_const(DataType::Int(32), region_id),
+        buffer_load,
+        make_const(DataType::Int(32), region_id),
     };
     for (auto x : size) {
       args_vec.push_back(make_const(DataType::Int(32), x));
@@ -812,11 +1226,10 @@ private:
     return Call(DataType::Handle(), region_op, args);
   }
 
- /**
-  * Find the index of the offset containing the loop variable.
-  * Returns -1 if not found, -2 if found in multiple offsets or indirect mem access.
-  */
-  int FindLoopVarInOffsets(const std::vector<PrimExpr>& offsets, const VarNode* loop_var) {
+  // Find which offset directly carries the loop var.
+  // Return -1 if not found, or -2 if it appears indirectly or multiple times.
+  int FindLoopVarInOffsets(const std::vector<PrimExpr> &offsets,
+                           const VarNode *loop_var) {
     int found_dim = -1;
 
     for (int i = 0; i < static_cast<int>(offsets.size()); ++i) {
@@ -824,15 +1237,16 @@ private:
 
       class LoopVarVisitor : public ExprVisitor {
       public:
-        const VarNode* target_var;
-        bool found = false;               // Whether appeared directly
-        bool& indirect_found;              // Whether appeared indirectly
-        bool indirect_scope = false;       // Status flag: whether the visitor is in a BufferLoad
+        const VarNode *target_var;
+        bool found = false;   // Found by direct use in the current offset
+        bool &indirect_found; // Found under a nested BufferLoad
+        bool indirect_scope =
+            false; // Track whether the current walk is inside a BufferLoad
 
-        LoopVarVisitor(const VarNode* var, bool& indirect_flag)
+        LoopVarVisitor(const VarNode *var, bool &indirect_flag)
             : target_var(var), indirect_found(indirect_flag) {}
 
-        void VisitExpr_(const VarNode* op) override {
+        void VisitExpr_(const VarNode *op) override {
           if (op == target_var) {
             if (indirect_scope) {
               indirect_found = true;
@@ -843,14 +1257,14 @@ private:
           ExprVisitor::VisitExpr_(op);
         }
 
-        void VisitExpr_(const BufferLoadNode* op) override {
-          // Visit a BufferLoad, set the status flag - indirect_scope
+        void VisitExpr_(const BufferLoadNode *op) override {
+          // Enter BufferLoad scope so loop-var uses below it count as indirect
           bool saved_scope = indirect_scope;
           indirect_scope = true;
-          for (const auto& index : op->indices) {
+          for (const auto &index : op->indices) {
             VisitExpr(index);
           }
-          // Reset the status flag
+          // Restore the previous scope after visiting the load indices
           indirect_scope = saved_scope;
         }
       } visitor(loop_var, indirect_found);
@@ -877,23 +1291,16 @@ private:
     return found_dim;
   }
 
-  Stmt SplitStmtToIndependentForNode(const ForNode* forNode, const Stmt& stmt){
-    Var new_loop_var = Var(
-      forNode->loop_var->name_hint + "_split",
-      forNode->loop_var->dtype
-    );
+  Stmt SplitStmtToIndependentForNode(const ForNode *forNode, const Stmt &stmt) {
+    Var new_loop_var =
+        Var(forNode->loop_var->name_hint + "_split", forNode->loop_var->dtype);
 
     Map<Var, PrimExpr> var_map;
     var_map.Set(forNode->loop_var, new_loop_var);
     Stmt new_body = Substitute(stmt, var_map);
 
-    return For(new_loop_var,
-               forNode->min,
-               forNode->extent,
-               forNode->kind,
-               new_body,
-               forNode->thread_binding,
-               forNode->annotations,
+    return For(new_loop_var, forNode->min, forNode->extent, forNode->kind,
+               new_body, forNode->thread_binding, forNode->annotations,
                forNode->span);
   }
 
@@ -904,53 +1311,63 @@ private:
     std::vector<size_t> sizes;
   };
 
-  std::optional<RegionInfo> ParseRegionCall(const PrimExpr &expr, arith::Analyzer *analyzer = nullptr) {
+  std::optional<RegionInfo>
+  ParseRegionCall(const PrimExpr &expr, arith::Analyzer *analyzer = nullptr) {
     // 1. must be a CallNode
     const auto *call = expr.as<CallNode>();
-    if (!call) return std::nullopt;
+    if (!call)
+      return std::nullopt;
 
     // 2. must be tl.region
     const auto *op_node = call->op.as<OpNode>();
-    if (!op_node) return std::nullopt;
+    if (!op_node)
+      return std::nullopt;
     static const auto *region_op = Op::Get("tl.region").as<OpNode>();
-    if (op_node != region_op) return std::nullopt;
+    if (op_node != region_op)
+      return std::nullopt;
 
     // 3. check the number of args and extract attributes
-    if (call->args.size() < 3) return std::nullopt;
+    if (call->args.size() < 3)
+      return std::nullopt;
 
     const auto *buffer_load = call->args[0].as<BufferLoadNode>();
-    if (!buffer_load) return std::nullopt;
+    if (!buffer_load)
+      return std::nullopt;
 
     Buffer buffer = buffer_load->buffer;
     Array<PrimExpr> offsets = buffer_load->indices;
     int d = buffer->shape.size();
 
     // 4. check the shapes
-    if (offsets.size() != d) return std::nullopt;
-    if (call->args.size() != d + 2) return std::nullopt;
+    if (offsets.size() != d)
+      return std::nullopt;
+    if (call->args.size() != d + 2)
+      return std::nullopt;
 
     // 5. try to extract region id & sizes
     auto regionId_val = TryGetConstIntValue(call->args[1], analyzer);
-    if (!regionId_val) return std::nullopt;
+    if (!regionId_val)
+      return std::nullopt;
     int regionId = static_cast<int>(*regionId_val);
 
     std::vector<size_t> sizes;
     for (int i = 2; i < d + 2; ++i) {
       auto size_val = TryGetConstIntValue(call->args[i], analyzer);
-      if (!size_val) return std::nullopt;
+      if (!size_val)
+        return std::nullopt;
       sizes.push_back(static_cast<size_t>(*size_val));
     }
 
     // post-processing: convert offsets into vector
     std::vector<PrimExpr> offsets_vec(offsets.begin(), offsets.end());
 
-    return RegionInfo{std::move(buffer), std::move(offsets_vec), regionId, std::move(sizes)};
+    return RegionInfo{std::move(buffer), std::move(offsets_vec), regionId,
+                      std::move(sizes)};
   }
 
   bool CheckContinuity(const Buffer &buffer,
                        const std::vector<PrimExpr> &offsets,
-                       const std::vector<size_t> &sizes,
-                       int loop_var_dim,
+                       const std::vector<size_t> &sizes, int loop_var_dim,
                        arith::Analyzer *analyzer = nullptr) {
     arith::Analyzer local_analyzer;
     arith::Analyzer *used_analyzer = analyzer ? analyzer : &local_analyzer;
@@ -960,31 +1377,40 @@ private:
     for (int i = 0; i < d; ++i) {
       const PrimExpr &size_expr = make_const(DataType::Int(32), sizes[i]);
       if (i <= loop_var_dim) {
-        // size of current and higher dimension should be 1; otherwise, something wrong happened
-        if (!used_analyzer->CanProveEqual(size_expr, 1)) return false;
+        // size of current and higher dimension should be 1; otherwise,
+        // something wrong happened
+        if (!used_analyzer->CanProveEqual(size_expr, 1))
+          return false;
       } else {
-        // lower dimensions must participate in the operation completely; otherwise, the current dimension cannot be vectorized.
-        // The first condition: The size is equal to the size of the corresponding dimension.
-        if (!used_analyzer->CanProveEqual(size_expr, buffer->shape[i])) return false;
+        // lower dimensions must participate in the operation completely;
+        // otherwise, the current dimension cannot be vectorized. The first
+        // condition: The size is equal to the size of the corresponding
+        // dimension.
+        if (!used_analyzer->CanProveEqual(size_expr, buffer->shape[i]))
+          return false;
         // The second condition: offset equals zero
-        if (!used_analyzer->CanProveEqual(offsets[i], 0)) return false;
+        if (!used_analyzer->CanProveEqual(offsets[i], 0))
+          return false;
       }
     }
 
     return true;
   }
 
-  std::optional<PrimExpr> AnalyzeNewOffset(const std::vector<PrimExpr> &offsets,
-                                           const VarNode* loop_var,
-                                           int loop_var_dim, int start,
-                                           arith::Analyzer *analyzer = nullptr) {
+  std::optional<PrimExpr>
+  AnalyzeNewOffset(const std::vector<PrimExpr> &offsets,
+                   const VarNode *loop_var, int loop_var_dim, int start,
+                   arith::Analyzer *analyzer = nullptr) {
     arith::Analyzer local_analyzer;
     arith::Analyzer *used_analyzer = analyzer ? analyzer : &local_analyzer;
 
-    // check the expression about loop var to ensure the continuity of mem access
-    Array<PrimExpr> res = arith::DetectLinearEquation(offsets[loop_var_dim], {GetRef<Var>(loop_var)});
+    // check the expression about loop var to ensure the continuity of mem
+    // access
+    Array<PrimExpr> res = arith::DetectLinearEquation(offsets[loop_var_dim],
+                                                      {GetRef<Var>(loop_var)});
     if (res.empty() || !used_analyzer->CanProveEqual(res[0], 1)) {
-      // Not a linear expression or the coefficient of the first term is not 1 -> disable to vectorize
+      // Not a linear expression or the coefficient of the first term is not 1
+      // -> disable to vectorize
       return std::nullopt;
     }
 
@@ -993,82 +1419,95 @@ private:
     return used_analyzer->Simplify(new_offset);
   }
 
-  std::optional<PrimExpr> TryVectorizeRegionInLoop(const PrimExpr& expr, const VarNode* loop_var, size_t start, size_t loop_count,
-                                                   arith::Analyzer *analyzer = nullptr){
+  std::optional<PrimExpr>
+  TryVectorizeRegionInLoop(const PrimExpr &expr, const VarNode *loop_var,
+                           size_t start, size_t loop_count,
+                           arith::Analyzer *analyzer = nullptr) {
     arith::Analyzer local_analyzer;
     arith::Analyzer *used_analyzer = analyzer ? analyzer : &local_analyzer;
 
     // Step 1: try to extract region info
     auto info = ParseRegionCall(expr, used_analyzer);
-    if (!info) return std::nullopt;
+    if (!info)
+      return std::nullopt;
 
     // Step 2: check the loop var
     int loop_var_dim = FindLoopVarInOffsets(info->offsets, loop_var);
-    // -2 -> multiple or indirect found -> dispersed mem access -> disable to vectorize
-    if (loop_var_dim == -2) return std::nullopt;
+    // -2 -> multiple or indirect found -> dispersed mem access -> disable to
+    // vectorize
+    if (loop_var_dim == -2)
+      return std::nullopt;
     // -1 -> not found -> invariant -> enable to vectorize but no need change
     if (loop_var_dim == -1) {
-      return BuildRegionCall(info->buffer, info->offsets, info->regionId, info->sizes);
+      return BuildRegionCall(info->buffer, info->offsets, info->regionId,
+                             info->sizes);
     }
 
     // Step 3: check the continuity of mem access
-    if (!CheckContinuity(info->buffer, info->offsets, info->sizes, loop_var_dim, used_analyzer)) {
+    if (!CheckContinuity(info->buffer, info->offsets, info->sizes, loop_var_dim,
+                         used_analyzer)) {
       return std::nullopt;
     }
 
     // Step 4: try to analyze the offset after vectorization
-    auto new_offset = AnalyzeNewOffset(info->offsets, loop_var, loop_var_dim, start, used_analyzer);
-    if (!new_offset) return std::nullopt;
+    auto new_offset = AnalyzeNewOffset(info->offsets, loop_var, loop_var_dim,
+                                       start, used_analyzer);
+    if (!new_offset)
+      return std::nullopt;
 
     // Step 5: build and return vectorized region
     info->offsets[loop_var_dim] = *new_offset;
     info->sizes[loop_var_dim] = loop_count;
 
-    return BuildRegionCall(info->buffer, info->offsets, info->regionId, info->sizes);
+    return BuildRegionCall(info->buffer, info->offsets, info->regionId,
+                           info->sizes);
   }
 
-  Stmt VectorizeForBody(const ForNode* forNode, const Stmt& stmt) {
+  Stmt VectorizeForBody(const ForNode *forNode, const Stmt &stmt) {
     arith::Analyzer analyzer;
 
-    if (const auto* alloc=stmt.as<AllocateNode>()){
+    if (const auto *alloc = stmt.as<AllocateNode>())
       return stmt;
-    }
 
-    // Only support evaluate node for vectorization
-    const auto* evaluate = stmt.as<EvaluateNode>();
-    if (!evaluate) return SplitStmtToIndependentForNode(forNode, stmt);
+    const auto *evaluate = stmt.as<EvaluateNode>();
+    if (!evaluate)
+      return SplitStmtToIndependentForNode(forNode, stmt);
 
-    // Only support call node inside evaluate node
-    const auto* call = evaluate->value.as<tvm::tir::CallNode>();
-    if (!call) return SplitStmtToIndependentForNode(forNode, stmt);
+    const auto *call = evaluate->value.as<tvm::tir::CallNode>();
+    if (!call)
+      return SplitStmtToIndependentForNode(forNode, stmt);
 
-    // Only Ops in 'CandidateVectorizationOps' are supported
     bool flag_op_supported = false;
-    if (const auto* op_node = call->op.as<tvm::OpNode>()) {
+    if (const auto *op_node = call->op.as<tvm::OpNode>()) {
       tvm::Op op = tvm::GetRef<tvm::Op>(op_node);
-      flag_op_supported = static_cast<bool>(CandidateVectorizationOps.count(op->name));
+      flag_op_supported =
+          static_cast<bool>(CandidateVectorizationOps.count(op->name));
     }
-    if (!flag_op_supported) return SplitStmtToIndependentForNode(forNode, stmt);
+    if (!flag_op_supported)
+      return SplitStmtToIndependentForNode(forNode, stmt);
 
-    // min_value & loop_extent_value must exist
     auto loop_min_value = TryGetConstIntValue(forNode->min, &analyzer);
     auto loop_extent_value = TryGetConstIntValue(forNode->extent, &analyzer);
-    if (!loop_min_value || !loop_extent_value) {
+    if (!loop_min_value || !loop_extent_value)
       return SplitStmtToIndependentForNode(forNode, stmt);
-    }
 
-    // Enable vectorization only when regions satisfy specific conditions
     auto loop_var_node_ptr = forNode->loop_var.get();
     std::vector<PrimExpr> new_regions;
-    for (const auto& region : call->args) {
-      if (IsScalar(region) || region.as<StringImmNode>()) {
+    for (const auto &region : call->args) {
+      if (IsScalar(region) || region.as<StringImmNode>() ||
+          region.as<VarNode>()) {
         new_regions.push_back(region);
         continue;
       }
-      auto new_region = TryVectorizeRegionInLoop(region, loop_var_node_ptr, *loop_min_value, *loop_extent_value, &analyzer);
-      if (!new_region) {
-        return SplitStmtToIndependentForNode(forNode, stmt);
+      if (region.as<BufferLoadNode>()) {
+        new_regions.push_back(region);
+        continue;
       }
+      auto new_region =
+          TryVectorizeRegionInLoop(region, loop_var_node_ptr, *loop_min_value,
+                                   *loop_extent_value, &analyzer);
+      if (!new_region)
+        return SplitStmtToIndependentForNode(forNode, stmt);
       new_regions.push_back(*new_region);
     }
 
@@ -1077,8 +1516,9 @@ private:
     return Evaluate(new_call);
   }
 
-  Stmt VectorizeForBody(const ForNode* forNode, const SeqStmt& seqStmt) {
+  Stmt VectorizeForBody(const ForNode *forNode, const SeqStmt &seqStmt) {
     std::vector<Stmt> result_vec;
+    result_vec.reserve(seqStmt->size());
     for (size_t i = 0; i < seqStmt->size(); ++i) {
       result_vec.push_back(VectorizeForBody(forNode, seqStmt[i]));
     }
@@ -1086,7 +1526,7 @@ private:
     return SeqStmt::Flatten(SeqStmt(result_arr));
   }
 
-  Stmt VisitStmt_(const ForNode* op) final {
+  Stmt VisitStmt_(const ForNode *op) final {
     // try vectorize only when marked as parallel
     if (op->kind != ForKind::kParallel) {
       return StmtMutator::VisitStmt_(op);
@@ -1094,13 +1534,13 @@ private:
 
     // recursive processing
     Stmt body = op->body;
-    if (const auto* forNode = body.as<ForNode>()) {
+    if (const auto *forNode = body.as<ForNode>()) {
       body = VisitStmt_(forNode);
     }
 
-    if (const auto* seqStmtNode = body.as<SeqStmtNode>()) {
+    if (const auto *seqStmtNode = body.as<SeqStmtNode>()) {
       return VectorizeForBody(op, GetRef<SeqStmt>(seqStmtNode));
-    } else if (const auto* stmtNode = body.as<EvaluateNode>()) {
+    } else if (const auto *stmtNode = body.as<EvaluateNode>()) {
       return VectorizeForBody(op, GetRef<Evaluate>(stmtNode));
     } else {
       return StmtMutator::VisitStmt_(op);
@@ -1111,7 +1551,7 @@ private:
 using namespace tir::transform;
 
 tvm::transform::Pass NpuLoopVectorize() {
-  auto pass_func = [=](PrimFunc f,IRModule m,PassContext ctx) {
+  auto pass_func = [=](PrimFunc f, IRModule m, PassContext ctx) {
     auto *new_pf = f.CopyOnWrite();
     new_pf->body = LoopDecompose()(std::move(new_pf->body));
     new_pf->body = LoopVectorize()(std::move(new_pf->body));
@@ -1120,7 +1560,8 @@ tvm::transform::Pass NpuLoopVectorize() {
   return CreatePrimFuncPass(pass_func, 0, "tl.NpuLoopVectorize", {});
 }
 
-TVM_REGISTER_GLOBAL("tl.transform.NpuLoopVectorize").set_body_typed(NpuLoopVectorize);
+TVM_REGISTER_GLOBAL("tl.transform.NpuLoopVectorize")
+    .set_body_typed(NpuLoopVectorize);
 
 } // namespace tl
 } // namespace tvm

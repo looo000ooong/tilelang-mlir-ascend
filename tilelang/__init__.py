@@ -8,6 +8,7 @@ import ctypes
 import logging
 from tqdm import tqdm
 
+
 class TqdmLoggingHandler(logging.Handler):
     """Custom logging handler that directs log output to tqdm progress bar to avoid interference."""
 
@@ -55,7 +56,7 @@ _init_logger()
 
 logger = logging.getLogger(__name__)
 
-from .env import SKIP_LOADING_TILELANG_SO
+from .env import env  # noqa: F401
 from .env import enable_cache, disable_cache, is_cache_enabled  # noqa: F401
 
 import tvm
@@ -78,12 +79,11 @@ def _load_tile_lang_lib():
 
 
 # only load once here
-if SKIP_LOADING_TILELANG_SO == "0":
+if env.SKIP_LOADING_TILELANG_SO == "0":
     _LIB, _LIB_PATH = _load_tile_lang_lib()
 
-from .jit import jit, JITKernel, compile  # noqa: F401
+from .jit import jit, compile  # noqa: F401
 from .profiler import Profiler  # noqa: F401
-from .cache import cached, set_cache_dir, get_cache_dir  # noqa: F401
 
 from .utils import (
     TensorSupplyType,  # noqa: F401

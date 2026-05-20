@@ -15,8 +15,9 @@ Within the TileLang ecosystem, we have developed an NPU Intermediate Representat
 <img src=./images/npuir_architecture.png style="width: 50%";/>
 </div>
 
-
 ## Latest News
+- 4/24/2026 🚀: Released DeepSeek V4 kernels [DeepSeek-V4](./examples/deepseek_v4)!
+- 3/28/2026 🚀: We provide a free environment to facilitate user experience and development for TileLang [Pull Request#708](https://github.com/tile-ai/tilelang-ascend/pull/708).
 
 - 1/23/2026 🚀: TileLang now supports CANN 8.5. Check out [Pull Request#334](https://github.com/tile-ai/tilelang-ascend/pull/334) and [Pull Request#346](https://github.com/tile-ai/tilelang-ascend/pull/346) for details!
 
@@ -43,6 +44,87 @@ https://github.com/tile-ai/tilelang-ascend/pull/129) for details!
 
 - 09/29/2025 🚀: Officially establish the NPU Intermediate Representation (AscendNPU IR) infrastructure for Ascend within the TileLang ecosystem, deeply integrating into the open-source AI compiler ecosystem based on MLIR. At the same time, deliver peak performance—fusion operators such as FlashAttention (FA) written in TileLang achieve performance on Ascend hardware that matches hand-written AscendC equivalents at a 1.0x level, balancing both development efficiency and ultimate performance!
 
+## High-Performance Ascend Operators with Developer Mode
+
+TileLang enables developers to write high-performance kernels on Ascend NPU with minimal effort. The following benchmarks demonstrate that TileLang achieves performance comparable to hand-written AscendC implementations.
+
+<h3 align="center">Cube Operators</h3>
+
+<p align="center"><b>Typical Case: GEMM</b> | <b>Average Performance: 0.98x AscendC</b> | <a href="https://github.com/tile-ai/tilelang-mlir-ascend/blob/main/examples/gemm/example_gemm.py">Example</a></p>
+
+<div align="center">
+
+<table>
+<tr>
+<th>Operator</th>
+<th>Test Shape</th>
+<th>AscendC (us)</th>
+<th>TileLang (us)</th>
+<th>Performance Ratio</th>
+</tr>
+<tr>
+<td>gemm</td>
+<td>M,N,K=(4096,4096,4096)</td>
+<td>497.930</td>
+<td>501.190</td>
+<td>0.993</td>
+</tr>
+<tr>
+<td>batch_gemm</td>
+<td>Batch,M,N,K=(8,4096,4096,4096)</td>
+<td>3800.376</td>
+<td>3963.859</td>
+<td>0.959</td>
+</tr>
+</table>
+
+</div>
+
+<h3 align="center">Vector Operators</h3>
+
+<p align="center"><b>Typical Case: DeepSeek-V4 mHC</b> | <b>Average Performance: 0.96x AscendC</b> | <a href="https://github.com/tile-ai/tilelang-mlir-ascend/blob/main/examples/deepseek_v4/example_hc_split_sinkhorn_kernel.py">Example</a></p>
+
+<div align="center">
+
+<table>
+<tr>
+<th>Operator</th>
+<th>Test Shape</th>
+<th>AscendC (us)</th>
+<th>TileLang (us)</th>
+<th>Performance Ratio</th>
+</tr>
+<tr>
+<td rowspan="3" valign="middle">hc_sinkhorn (DSV4)</td>
+<td>b*s=128; hc=4; d=4096</td>
+<td>24.6</td>
+<td>28.21</td>
+<td>0.872</td>
+</tr>
+<tr>
+<td>b*s=4096; hc=4; d=4096</td>
+<td>485.97</td>
+<td>490.84</td>
+<td>0.990</td>
+</tr>
+<tr>
+<td>b*s=16384; hc=4; d=4096</td>
+<td>1902.1</td>
+<td>1850.12</td>
+<td>1.028</td>
+</tr>
+</table>
+
+</div>
+
+<h3 align="center">Cube-Vector Operators</h3>
+
+<p align="center"><b>Typical Case: Flash Attention</b> | <b>Average Performance: 0.95x AscendC</b> | <a href="https://github.com/tile-ai/tilelang-mlir-ascend/blob/highperf-dev/examples/flash_attn_npuir_highperf-dev.py">Example</a></p>
+
+<div align="center">
+<img src=./images/fa_performance.png width="80%" />
+</div>
+
 ## Environment Variables Guide
 Currently, we need to set environment variables to configure the developer mode or expert mode. For more environment variables, please refer to the [EnvironmentVariables.md](https://github.com/tile-ai/tilelang-ascend/tree/npuir/docs/developer/EnvironmentVariables.md)
 | Variable | Default | Description | Valid Values |
@@ -50,8 +132,10 @@ Currently, we need to set environment variables to configure the developer mode 
 | `TILELANG_ASCEND_MODE` | Expert | Set the TileLang Mode; currently, Expert mode and Developer mode are supported | `Expert`: Expert Mode<br>`Developer`: Developer Mode |
 
 ## Tested Devices
-Although TileLang aims to support portability across a variety of devices, it has been specifically tested and validated on the following hardware:Huawei Ascend AI accelerators,including Ascend 910B/C.
+Although TileLang aims to support portability across a variety of devices, it has been specifically tested and validated on the following hardware:Huawei Ascend AI accelerators, including A2/A3.
 
+## Accessing Ascend NPU
+If you need to access Ascend NPU computing resources for development or testing, please visit the [HiDevLab - Online Development](https://hidevlab.huawei.com/online-develop-intro) page on the Huawei HiDevLab platform to apply for and use them
 
 ## OP Implementation Examples
 **tile-lang** provides the building blocks to implement a wide variety of operators. Some examples include:
@@ -61,7 +145,6 @@ Although TileLang aims to support portability across a variety of devices, it ha
 
 Within the `examples` directory, you will also find additional complex kernels—such as convolutions, forward/backward passes for FlashAttention, more operators will continuously be added.
 
-
 ## Installation
 ### Environment Setup
 
@@ -70,7 +153,7 @@ Install the Ascend Toolkit.
 [Download the installation package](https://www.hiascend.com/developer/download/community/result?cann=8.3.RC1.alpha002)，install`Ascend-cann-toolkit`.For complete installation instructions, refer to the [relevant documentation](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/83RC1alpha002/softwareinst/instg/instg_0008.html?Mode=PmIns&OS=Debian&Software=cannToolKit).
 
 ```shell
-chmod +x Ascend-cann-toolkit_{ascend-cann-toolkit version}_linux-aarch64.run
+chmod +x Ascend-cann-toolkit_{ascend_cann_toolkit version}_linux-aarch64.run
 ./Ascend-cann-toolkit_{ascend-cann-toolkit version}_linux-aarch64.run --install
 ```
 
@@ -82,14 +165,11 @@ source /path/to/install/Ascend/ascend-toolkit/set_env.sh
 
 Prepare a Python environment with Python version between 3.7.*x* and 3.11.4 (inclusive) and ensure that `pip3` is available.
 
-
    Ascend Toolkit Installation Requirements
 
    ```shell
    pip3 install attrs cython 'numpy>=1.19.2,<=1.24.0' decorator sympy cffi pyyaml pathlib2 psutil protobuf==3.20.0 scipy requests absl-py
    ```
-
-
 
 <!-- 补充环境变量设置 -->
 Set Environment Variables
@@ -99,11 +179,8 @@ export ACL_OP_INIT_MODE=1
 ```
   <!-- 注意：如果用户需要新的编译器安装包，请联系社区管理员zhaojiqiao@huawei.com,yangsichan@huawei.com TEL:15901269653 -->
 
-  Note: If you require a new compiler installation package, please contact the community administrators:  
-**zhaojiqiao@huawei.com**, **yangsichan@huawei.com**  
-
-
-   
+  Note: If you require a new compiler installation package, please contact the community administrators:
+**zhaojiqiao@huawei.com**, **yangsichan@huawei.com**
 
 #### Build
 
@@ -111,7 +188,7 @@ export ACL_OP_INIT_MODE=1
 Pull the code
 
 ```shell
-git clone https://github.com/tile-ai/tilelang-ascend.git --recursive -b npuir
+git clone https://github.com/tile-ai/tilelang-ascend.git --recursive
 ```
 
 <!-- 执行安装脚本 -->
@@ -157,12 +234,12 @@ seq_len = 4096  # Length of the vectors to be added
 def vec_add(N, block_N, dtype="float32"):
     """
     Define a vector addition kernel using TileLang.
-    
+
     Parameters:
     - N: Total length of the vectors.
     - block_N: Number of elements processed per kernel thread/block.
     - dtype: Data type of the tensors (default: "float32").
-    
+
     Returns:
     - A TileLang prim_func representing the vector addition kernel.
     """
@@ -251,14 +328,14 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
         C: T.Tensor((M, N), dtype), # Output matrix C
     ):
         with T.Kernel(T.ceildiv(N, block_N) * T.ceildiv(M, block_M), is_npu=True) as (cid, _):
-          
+
             by = cid // T.ceildiv(N, block_N) # Block row index
             bx = cid % T.ceildiv(N, block_N)  # Block column index
 
             # Alloc shared memory for inputs
             A_shared = T.alloc_shared((block_M, block_K), dtype)
             B_shared = T.alloc_shared((block_K, block_N), dtype)
-          
+
             # Alloc local fragment for accumulation
             C_local = T.alloc_fragment((block_M, block_N), accum_dtype)
 
@@ -267,7 +344,7 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
                 # Copy the data from global memory to shared memory
                 T.copy(A[by * block_M, k * block_K], A_shared)
                 T.copy(B[k * block_K, bx * block_N], B_shared)
-              
+
                 # Perform matrix multiplication with accumulation
                 # If 'initC' is true, the result matrix will be initialized to zero before accumulation
                 T.gemm(A_shared, B_shared, C_local, initC=(k == 0))
@@ -284,4 +361,3 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
 ## Acknowledgements
 
 Peking University Kunpeng & Ascend Center for Excellence in Science, Education, Innovation
-

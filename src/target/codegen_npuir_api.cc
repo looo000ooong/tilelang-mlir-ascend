@@ -39,11 +39,12 @@
 #include <vector>
 
 // For adding MLIR APIs to support codegen
+#include <bishengir/Dialect/Utils/Util.h>
 #include <llvm/ADT/APFloat.h>
 #include <llvm/ADT/ArrayRef.h>
+#include <llvm/ADT/STLExtras.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/ADT/Twine.h>
-#include <llvm/ADT/STLExtras.h>
 #include <llvm/Support/Casting.h>
 #include <mlir/Conversion/Passes.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
@@ -64,7 +65,6 @@
 #include <mlir/IR/Value.h>
 #include <mlir/IR/Verifier.h>
 #include <mlir/Pass/PassManager.h>
-#include <bishengir/Dialect/Utils/Util.h>
 
 // //===----------------------------------------------------------------------===//
 // // HIVM Dialect
@@ -184,11 +184,9 @@ getBroadcastDim(const llvm::ArrayRef<long int> &buffer_shape0,
   }
   CHECK(buffer_shape0.size() == buffer_shape1.size());
   for (int i = 0; i < buffer_shape0.size(); i++) {
-    if ((buffer_shape0[i]) == 1 &&
-        (buffer_shape1[i]) != 1) {
+    if ((buffer_shape0[i]) == 1 && (buffer_shape1[i]) != 1) {
       dims.emplace_back(i);
-    } else if ((buffer_shape0[i]) != 1 &&
-               (buffer_shape1[i]) == 1) {
+    } else if ((buffer_shape0[i]) != 1 && (buffer_shape1[i]) == 1) {
       dims.emplace_back(i);
     } else {
       CHECK((buffer_shape0[i]) == (buffer_shape1[i]));
@@ -246,50 +244,50 @@ std::vector<int64_t> GetStrideFromShapeAPI(Array<tvm::PrimExpr> shape) {
 }
 
 namespace {
-  /// Infer function core type: aic, aiv, mix
-  class InferFuncCoreType : public StmtExprVisitor {
-    std::map<std::string, NPU_CORETYPE> scope_coretype_map{
-        {"shared", NPU_CORETYPE::AIV},
-        {"shared.dyn", NPU_CORETYPE::AIC},
-        {"wmma.accumulator", NPU_CORETYPE::AIC},
-        {"wmma.matrix_a", NPU_CORETYPE::AIC},
-        {"wmma.matrix_b", NPU_CORETYPE::AIC}};
-  
-  public:
-    void VisitStmt(const Stmt &stmt) override {
-      StmtExprVisitor::VisitStmt(stmt);
+/// Infer function core type: aic, aiv, mix
+class InferFuncCoreType : public StmtExprVisitor {
+  std::map<std::string, NPU_CORETYPE> scope_coretype_map{
+      {"shared", NPU_CORETYPE::AIV},
+      {"shared.dyn", NPU_CORETYPE::AIC},
+      {"wmma.accumulator", NPU_CORETYPE::AIC},
+      {"wmma.matrix_a", NPU_CORETYPE::AIC},
+      {"wmma.matrix_b", NPU_CORETYPE::AIC}};
+
+public:
+  void VisitStmt(const Stmt &stmt) override {
+    StmtExprVisitor::VisitStmt(stmt);
+  }
+  void VisitStmt_(const AttrStmtNode *op) final {
+    // It is mixkernel iff there exists T.rs.
+    if (op->attr_key == "resource_scope") {
+      func_coretype = NPU_CORETYPE::MIX;
+      return;
     }
-    void VisitStmt_(const AttrStmtNode *op) final {
-      // It is mixkernel iff there exists T.rs.
-      if (op->attr_key == "resource_scope") {
-        func_coretype = NPU_CORETYPE::MIX;
-        return;
-      }
-      StmtExprVisitor::VisitStmt_(op);
-    }
-    void VisitExpr_(const CallNode *op) final {
-      // It is cube kernel if there exists T.npuir_dot.
-      if (op->op.same_as(Op::Get("tl.npuir_dot"))) {
-        if (func_coretype != NPU_CORETYPE::MIX) {
-          func_coretype = NPU_CORETYPE::AIC;
-        }
-      }
-      StmtExprVisitor::VisitExpr_(op);
-    }
-    void VisitStmt_(const AllocateNode *op) final {
-      // It is cube kernel if there exists buffer with shared.dyn/wmma.xxx address
-      // space
-      std::string scope = GetPtrStorageScope(op->buffer_var);
+    StmtExprVisitor::VisitStmt_(op);
+  }
+  void VisitExpr_(const CallNode *op) final {
+    // It is cube kernel if there exists T.npuir_dot.
+    if (op->op.same_as(Op::Get("tl.npuir_dot"))) {
       if (func_coretype != NPU_CORETYPE::MIX) {
-        if (scope_coretype_map.count(scope) != 0) {
-          func_coretype = scope_coretype_map[scope];
-        }
+        func_coretype = NPU_CORETYPE::AIC;
       }
-      StmtExprVisitor::VisitStmt_(op);
     }
-    NPU_CORETYPE func_coretype{NPU_CORETYPE::AIV};
-  };
-}  // namespace
+    StmtExprVisitor::VisitExpr_(op);
+  }
+  void VisitStmt_(const AllocateNode *op) final {
+    // It is cube kernel if there exists buffer with shared.dyn/wmma.xxx address
+    // space
+    std::string scope = GetPtrStorageScope(op->buffer_var);
+    if (func_coretype != NPU_CORETYPE::MIX) {
+      if (scope_coretype_map.count(scope) != 0) {
+        func_coretype = scope_coretype_map[scope];
+      }
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+  NPU_CORETYPE func_coretype{NPU_CORETYPE::AIV};
+};
+} // namespace
 
 /*****************************************************************************************
 ******************************************************************************************
@@ -298,187 +296,6 @@ Todo: Remove CodeGenTileLangNPUIR class and use all functions from
 CodeGenTileLangNPUIRAPI
 ******************************************************************************************
 ******************************************************************************************/
-
-void CodeGenTileLangNPUIRAPI::SmartMemRefCopy(mlir::Value src, mlir::Value dst) {
-  auto src_type = src.getType().cast<mlir::MemRefType>();
-  auto dst_type = dst.getType().cast<mlir::MemRefType>();
-  auto loc = builder.getUnknownLoc();
-
-  // Copy if shape match
-  if (src_type.getShape() == dst_type.getShape()) {
-    builder.create<mlir::memref::CopyOp>(loc, TypeRange{}, src, dst);
-    return;
-  }
-
-  // 2. Try Reinterpret Copy if shape not match but numElements match
-  if (src_type.getNumElements() == dst_type.getNumElements()) {
-      
-    // safety check: stride hack only when elementTypes match
-    if (src_type.getElementType() != dst_type.getElementType()) {
-      ICHECK(false) << "HandleMemRefReshapeCopy requires same element type.";
-      return;
-    }
-
-    // Get offset of src MemRef
-    auto extractOp = builder.create<mlir::memref::ExtractStridedMetadataOp>(loc, src);
-    mlir::Value offsetValue = extractOp.getOffset();
-
-    llvm::SmallVector<mlir::OpFoldResult> offsets;
-    offsets.push_back(offsetValue);
-
-    // 1. get sizes for dst value.
-    llvm::SmallVector<mlir::OpFoldResult> sizes;
-    llvm::SmallVector<mlir::Value> dim_values;
-
-    for (int i = 0; i < dst_type.getRank(); ++i) {
-      int64_t static_dim = dst_type.getDimSize(i);
-      
-      if (mlir::ShapedType::isDynamic(static_dim)) {
-        mlir::Value dim_val = builder.create<mlir::memref::DimOp>(loc, dst, i);
-        sizes.push_back(dim_val);
-        dim_values.push_back(dim_val);
-      } else {
-        sizes.push_back(builder.getIndexAttr(static_dim));
-        dim_values.push_back(builder.create<mlir::arith::ConstantIndexOp>(loc, static_dim));
-      }
-    }
-
-    // 2. Compute strides for StridedLayoutAttr
-    // Rule: Calculate from the last dimension to the first. When encountering a dynamic dimension,
-    // the current and all preceding strides become dynamic.
-    llvm::SmallVector<int64_t> layout_strides(dst_type.getRank(), mlir::ShapedType::kDynamic);
-    int64_t current_stride = 1;
-    bool all_static_so_far = true;
-
-    // Calculate from the lowest dimension (last dimension) to the highest
-    for (int i = dst_type.getRank() - 1; i >= 0; --i) {
-      int64_t dim_size = dst_type.getDimSize(i);
-      
-      // Set stride for the current dimension
-      if (i == dst_type.getRank() - 1) {
-        // The lowest dimension's stride is always 1
-        layout_strides[i] = 1;
-      } else {
-        // Normal case
-        layout_strides[i] = current_stride;
-      }
-      
-      // Update current_stride for the next dimension (higher dimension)
-      if (mlir::ShapedType::isDynamic(dim_size)) {
-        all_static_so_far = false;
-        break;
-      } else {
-        current_stride *= dim_size;
-      }
-    }
-
-    // 3. Prepare dynamic strides parameters for reinterpret_cast
-    llvm::SmallVector<mlir::OpFoldResult> strides;
-
-    if (all_static_so_far) {
-      // All static: use static stride values
-      for (int64_t stride : layout_strides) {
-        strides.push_back(builder.getIndexAttr(stride));
-      }
-    } else {
-      // Has dynamic dimensions: need to compute dynamic strides
-      // Create a vector to store computed strides (calculated from back to front)
-      llvm::SmallVector<mlir::Value> temp_strides(dst_type.getRank());
-      
-      // Calculate from back to front
-      mlir::Value current_dyn_stride = builder.create<mlir::arith::ConstantIndexOp>(loc, 1);
-      for (int i = dst_type.getRank() - 1; i >= 0; --i) {
-        // Store stride for current dimension
-        temp_strides[i] = current_dyn_stride;
-        
-        if (i > 0) {
-          // Update current_dyn_stride for the next dimension (higher dimension)
-          // current_dimension_stride * current_dimension_size
-          current_dyn_stride = builder.create<mlir::arith::MulIOp>(
-              loc, current_dyn_stride, dim_values[i]);
-        }
-      }
-      
-      // Convert temp_strides to OpFoldResult and add to strides in order
-      for (int i = 0; i < dst_type.getRank(); ++i) {
-        strides.push_back(temp_strides[i]);
-      }
-    }
-
-    // 4. Create StridedLayoutAttr
-    auto layout = mlir::StridedLayoutAttr::get(
-        &context, 
-        mlir::ShapedType::kDynamic,
-        layout_strides);
-
-    // 5. Create target type
-    mlir::MemRefType new_dst_type = mlir::MemRefType::get(
-        dst_type.getShape(),
-        dst_type.getElementType(),
-        layout,
-        src_type.getMemorySpace());
-
-    // 6. Create reinterpret_cast
-    mlir::Value reinterpreted_src = builder.create<mlir::memref::ReinterpretCastOp>(
-        loc,
-        new_dst_type,
-        src,
-        offsets,
-        sizes,
-        strides
-    );
-    
-    // 7. Copy
-    builder.create<mlir::memref::CopyOp>(loc, TypeRange{}, reinterpreted_src, dst);
-
-    return;
-  }
-
-  // 3. Copy with shape mismatch: use the smaller extent to avoid overflow.
-  //    - src dynamic (remain_M, remain_N), dst static (32, 32): subview dst to
-  //      src's sizes, copy src -> dst_sub.
-  //    - src static (32, 32), dst dynamic (remain_M, remain_N): subview src to
-  //      dst's sizes, copy src_sub -> dst.
-  if (src_type.getRank() == dst_type.getRank() &&
-      src_type.getElementType() == dst_type.getElementType()) {
-    llvm::SmallVector<mlir::OpFoldResult> zeros(dst_type.getRank(),
-                                                builder.getIndexAttr(0));
-    llvm::SmallVector<mlir::OpFoldResult> strides(dst_type.getRank(),
-                                                  builder.getIndexAttr(1));
-    llvm::SmallVector<mlir::OpFoldResult> sizes;
-    bool use_src_sizes = false;  // true => subview dst to copy src in; else subview src
-    for (int i = 0; i < src_type.getRank(); ++i) {
-      bool src_dyn = mlir::ShapedType::isDynamic(src_type.getDimSize(i));
-      bool dst_dyn = mlir::ShapedType::isDynamic(dst_type.getDimSize(i));
-      if (src_dyn && !dst_dyn) {
-        use_src_sizes = true;
-        sizes.push_back(
-            builder.create<mlir::memref::DimOp>(loc, src, i).getResult());
-      } else if (!src_dyn && dst_dyn) {
-        sizes.push_back(
-            builder.create<mlir::memref::DimOp>(loc, dst, i).getResult());
-      } else if (src_dyn && dst_dyn) {
-        use_src_sizes = true;
-        sizes.push_back(
-            builder.create<mlir::memref::DimOp>(loc, src, i).getResult());
-      } else {
-        // Both static: use dst sizes so we subview src and never overflow dst
-        sizes.push_back(builder.getIndexAttr(dst_type.getDimSize(i)));
-      }
-    }
-    if (use_src_sizes) {
-      mlir::Value dst_sub = builder.create<mlir::memref::SubViewOp>(
-          loc, dst, zeros, sizes, strides);
-      builder.create<mlir::memref::CopyOp>(loc, TypeRange{}, src, dst_sub);
-    } else {
-      mlir::Value src_sub = builder.create<mlir::memref::SubViewOp>(
-          loc, src, zeros, sizes, strides);
-      builder.create<mlir::memref::CopyOp>(loc, TypeRange{}, src_sub, dst);
-    }
-    return;
-  }
-  ICHECK(false) << "SmartMemRefCopy: Shape mismatch and cannot interpret cast. ";
-}
 
 mlir::Value CodeGenTileLangNPUIRAPI::ScalarConvertType(const PrimExpr &imm,
                                                        DataType targetDtype) {
@@ -501,6 +318,13 @@ std::string CodeGenTileLangNPUIRAPI::Finish() {
   std::string mlirCode;
   llvm::raw_string_ostream os(mlirCode);
   module->print(os);
+
+  if (failed(mlir::verify(*module))) {
+    LOG(FATAL) << "CodeGenTileLangNPUIRAPI: Generated MLIR module failed "
+                  "verification: \n"
+               << mlirCode;
+  }
+
   return mlirCode;
 }
 
@@ -517,19 +341,73 @@ CodeGenTileLangNPUIRAPI::GetHIVMAddressSpace(String address_space) {
   return mlir::hivm::AddressSpace::Zero;
 }
 
-inline std::vector<long int>
+inline std::vector<int64_t>
 CodeGenTileLangNPUIRAPI::GetShape(Array<PrimExpr> shape_in) {
-  std::vector<long int> shape;
+  std::vector<int64_t> shape;
   for (PrimExpr s : shape_in) {
     if (auto s_int = as_const_int(s)) {
       // Statically known dimension
       shape.push_back(*s_int);
     } else {
       // Dynamic dimension "?x";
-      shape.push_back(-1);
+      shape.push_back(mlir::ShapedType::kDynamic);
     }
   }
   return shape;
+}
+
+static llvm::SmallVector<PrimExpr>
+BuildContiguousStrideExprs(llvm::ArrayRef<PrimExpr> shape) {
+  llvm::SmallVector<PrimExpr> strides(shape.size());
+  if (shape.empty()) {
+    return strides;
+  }
+
+  arith::Analyzer analyzer;
+  PrimExpr running = IntImm(shape.front().dtype(), 1);
+  for (int i = static_cast<int>(shape.size()) - 1; i >= 0; --i) {
+    strides[i] = analyzer.Simplify(running);
+    running = analyzer.Simplify(Mul(shape[i], running));
+  }
+  return strides;
+}
+
+template <typename OnStatic, typename OnDynamic>
+static void DispatchSimplifiedExpr(llvm::ArrayRef<PrimExpr> exprs,
+                                   OnStatic &&onStatic, OnDynamic &&onDynamic) {
+  arith::Analyzer analyzer;
+  for (PrimExpr expr : exprs) {
+    PrimExpr simplified = analyzer.Simplify(expr);
+    if (auto intImm = as_const_int(simplified)) {
+      onStatic(*intImm);
+    } else {
+      onDynamic(simplified);
+    }
+  }
+}
+
+static llvm::SmallVector<int64_t>
+ExtractStaticInts(llvm::ArrayRef<PrimExpr> exprs) {
+  llvm::SmallVector<int64_t> staticValues;
+  staticValues.reserve(exprs.size());
+  DispatchSimplifiedExpr(
+      exprs, [&](int64_t value) { staticValues.push_back(value); },
+      [&](PrimExpr) { staticValues.push_back(mlir::ShapedType::kDynamic); });
+  return staticValues;
+}
+
+template <typename MaterializeFn>
+static llvm::SmallVector<mlir::OpFoldResult>
+BuildIndexFoldResultsFromExprs(mlir::OpBuilder &builder,
+                               llvm::ArrayRef<PrimExpr> exprs,
+                               MaterializeFn &&materialize) {
+  llvm::SmallVector<mlir::OpFoldResult> ofrs;
+  ofrs.reserve(exprs.size());
+  DispatchSimplifiedExpr(
+      exprs,
+      [&](int64_t value) { ofrs.push_back(builder.getIndexAttr(value)); },
+      [&](PrimExpr simplified) { ofrs.push_back(materialize(simplified)); });
+  return ofrs;
 }
 
 mlir::Type CodeGenTileLangNPUIRAPI::GetMLIRType(const PrimExpr &expr) {
@@ -539,39 +417,14 @@ mlir::Type CodeGenTileLangNPUIRAPI::GetMLIRType(const PrimExpr &expr) {
 }
 
 mlir::Type CodeGenTileLangNPUIRAPI::GetMLIRType(const Buffer &buffer) {
-  llvm::SmallVector<int64_t> shape, stride;
-  int64_t base = 1;
-  bool isDynamicShape = false;
-  for (auto s : buffer->shape) {
-    auto intImm = s.as<tvm::tir::IntImmNode>();
-    if (intImm != nullptr) {
-      shape.emplace_back(intImm->value);
-      base *= intImm->value;
-    } else {
-      shape.emplace_back(ShapedType::kDynamic);
-      isDynamicShape = true;
-    }
-  }
-  if (buffer->strides.size()) {
-    for (auto s : buffer->strides) {
-      auto intImm = s.as<tvm::tir::IntImmNode>();
-      if (intImm != nullptr) {
-        stride.emplace_back(intImm->value);
-      } else {
-        stride.emplace_back(ShapedType::kDynamic);
-      }
-    }
-  } else {
-    for (auto s : buffer->shape) {
-      auto intImm = s.as<tvm::tir::IntImmNode>();
-      if (!isDynamicShape) {
-        base /= intImm->value;
-        stride.emplace_back(base);
-      } else {
-        stride.emplace_back(ShapedType::kDynamic);
-      }
-    }
-  }
+  llvm::SmallVector<PrimExpr> shapeExprs(buffer->shape.begin(),
+                                         buffer->shape.end());
+  llvm::SmallVector<int64_t> shape = ExtractStaticInts(shapeExprs);
+  llvm::SmallVector<int64_t> stride =
+      buffer->strides.empty()
+          ? ExtractStaticInts(BuildContiguousStrideExprs(shapeExprs))
+          : ExtractStaticInts(llvm::SmallVector<PrimExpr>(
+                buffer->strides.begin(), buffer->strides.end()));
   auto elementType = DTypetoMLIRType(buffer->dtype);
   auto offset = 0;
   String scope = GetPtrStorageScope(buffer->data);
@@ -596,7 +449,7 @@ void CodeGenTileLangNPUIRAPI::VisitStmt_(const tir::ForNode *op) {
       mlir::UnknownLoc::get(&context),
       builder.getIntegerAttr(GetMLIRType(op->min), 1));
   auto forOp = builder.create<mlir::scf::ForOp>(module->getLoc(), lowerBoundId,
-                                                 upperBoundId, step);
+                                                upperBoundId, step);
   // Set the insertion point to the body of the loop
   OpBuilder::InsertionGuard saved(builder);
   builder.setInsertionPointToStart(forOp.getBody());
@@ -945,6 +798,8 @@ mlir::Value CodeGenTileLangNPUIRAPI::GenRankReducedSubviewFromRegion(
     extent stores the shape or size of region
     min stores the offset of the region
   */
+  ICHECK(!range.empty())
+      << "GenRankReducedSubviewFromRegion requires a non-scalar region.";
   Array<PrimExpr> region_shape, region_indices;
   for (Range r : range) {
     region_shape.push_back(r.get()->extent);
@@ -981,42 +836,45 @@ mlir::Value CodeGenTileLangNPUIRAPI::GenRankReducedSubviewFromRegion(
 
   auto baseTy = v_value.getType().cast<mlir::MemRefType>();
 
-  // Build projected reduced shape by dropping static-1 dims from slice sizes.
-  // When min_rank > 0, keep leading static-1 dims as needed to satisfy the
-  // minimum rank requirement. This ensures GM operands for Cube nd2nz/fixpipe
-  // maintain consistent rank (2D) across all calls in the same function.
-  
-  // 1. Count non-static-1 dims
   int numNonStatic1 = 0;
   for (auto ofr : sizes) {
-    if (!IsStaticIntOFR(ofr, 1)) numNonStatic1++;
+    if (!IsStaticIntOFR(ofr, 1))
+      numNonStatic1++;
   }
-  // 2. How many static-1 dims must we keep to satisfy min_rank?
+  int totalStatic1 = sizes.size() - numNonStatic1;
   int static1ToKeep = std::max(0, min_rank - numNonStatic1);
+  int static1ToDrop = std::max(0, totalStatic1 - static1ToKeep);
 
-  // 3. Build projected shape, keeping leading static-1 dims as needed
+  // Track keptDims explicitly; `inferRankReducedResultType`'s heuristic is
+  // ambiguous when sizes have multiple static-1 extents (e.g. [1,64,1] ->
+  // [64,1] vs [1,64]). Drop leading 1s, keep trailing ones.
   llvm::SmallVector<int64_t> projectedReducedShape;
+  llvm::SmallVector<unsigned> keptDims;
   projectedReducedShape.reserve(sizes.size());
-  int static1Kept = 0;
-  for (auto ofr : sizes) {
+  keptDims.reserve(sizes.size());
+  int static1Dropped = 0;
+  for (unsigned i = 0; i < sizes.size(); ++i) {
+    auto ofr = sizes[i];
     if (IsStaticIntOFR(ofr, 1)) {
-      if (static1Kept < static1ToKeep) {
-        projectedReducedShape.push_back(1);
-        static1Kept++;
+      if (static1Dropped < static1ToDrop) {
+        static1Dropped++;
+        continue;
       }
-      continue;  // drop this static-1 dim
+      projectedReducedShape.push_back(1);
+      keptDims.push_back(i);
+      continue;
     }
-    // non-static-1 dim: always keep
+    keptDims.push_back(i);
     if (auto attr = ofr.dyn_cast<mlir::Attribute>()) {
-      projectedReducedShape.push_back(
-          attr.cast<mlir::IntegerAttr>().getInt());
+      projectedReducedShape.push_back(attr.cast<mlir::IntegerAttr>().getInt());
     } else {
       projectedReducedShape.push_back(mlir::ShapedType::kDynamic);
     }
   }
-  // Fallback: if all dims are static-1 and min_rank <= 1, keep one dim=1
+  // memref rank must be >= 1; reinstate the trailing dim if all were dropped.
   if (projectedReducedShape.empty()) {
     projectedReducedShape.push_back(1);
+    keptDims.push_back(static_cast<unsigned>(sizes.size()) - 1);
   }
 
   // Fast path: only reuse the original memref when no rank reduction is needed.
@@ -1027,11 +885,33 @@ mlir::Value CodeGenTileLangNPUIRAPI::GenRankReducedSubviewFromRegion(
     return v_value;
   }
 
-  // Infer the rank-reduced memref type and create the SubViewOp.
-  auto reducedTy =
-      mlir::memref::SubViewOp::inferRankReducedResultType(
-          projectedReducedShape, baseTy, offsets, sizes, strides)
+  // Project the full-rank inferred type through `keptDims` ourselves so the
+  // kept dimensions are explicit rather than heuristic-inferred.
+  auto fullSubviewTy =
+      mlir::memref::SubViewOp::inferResultType(baseTy, offsets, sizes, strides)
           .cast<mlir::MemRefType>();
+  mlir::MemRefType reducedTy;
+  if (static_cast<int64_t>(keptDims.size()) == fullSubviewTy.getRank()) {
+    reducedTy = fullSubviewTy;
+  } else {
+    auto fullLayout =
+        fullSubviewTy.getLayout().dyn_cast<mlir::StridedLayoutAttr>();
+    ICHECK(fullLayout)
+        << "rank-reduced subview requires a strided base layout.";
+    llvm::SmallVector<int64_t> keptShape;
+    llvm::SmallVector<int64_t> keptStrides;
+    keptShape.reserve(keptDims.size());
+    keptStrides.reserve(keptDims.size());
+    for (unsigned d : keptDims) {
+      keptShape.push_back(fullSubviewTy.getShape()[d]);
+      keptStrides.push_back(fullLayout.getStrides()[d]);
+    }
+    auto reducedLayout = mlir::StridedLayoutAttr::get(
+        baseTy.getContext(), fullLayout.getOffset(), keptStrides);
+    reducedTy =
+        mlir::MemRefType::get(keptShape, fullSubviewTy.getElementType(),
+                              reducedLayout, fullSubviewTy.getMemorySpace());
+  }
 
   return builder.create<mlir::memref::SubViewOp>(
       builder.getUnknownLoc(), reducedTy, v_value, offsets, sizes, strides);
@@ -1077,10 +957,10 @@ mlir::Value CodeGenTileLangNPUIRAPI::GenSubviewFromRegion(Buffer buffer_data,
 
   auto subViewOp =
       builder.create<mlir::memref::SubViewOp>(builder.getUnknownLoc(),
-                                               v_value,    // Original memref
-                                               offsets,    // Offset
-                                               shape_val,  // Sizes or shape
-                                               strides_val // Strides
+                                              v_value,    // Original memref
+                                              offsets,    // Offset
+                                              shape_val,  // Sizes or shape
+                                              strides_val // Strides
       );
   return subViewOp;
 }
@@ -1091,12 +971,13 @@ mlir::Value CodeGenTileLangNPUIRAPI::CreateIndexCastOp(mlir::Value src) {
     return result.second;
   }
   mlir::Value indexVal = builder.create<mlir::arith::IndexCastOp>(
-    builder.getUnknownLoc(), builder.getIndexType(), src);
+      builder.getUnknownLoc(), builder.getIndexType(), src);
   UpdateMLIRValueMap(src, indexVal);
   return indexVal;
 }
 
-inline std::pair<bool, mlir::Value> CodeGenTileLangNPUIRAPI::CheckMLIRValueMap(mlir::Value val){
+inline std::pair<bool, mlir::Value>
+CodeGenTileLangNPUIRAPI::CheckMLIRValueMap(mlir::Value val) {
   mlir::Block *curr_block = builder.getInsertionBlock();
   auto it = this->mlir_value_map.find({val, curr_block});
   if (it != this->mlir_value_map.end()) {
@@ -1105,12 +986,14 @@ inline std::pair<bool, mlir::Value> CodeGenTileLangNPUIRAPI::CheckMLIRValueMap(m
   return std::pair(false, mlir::Value());
 }
 
-inline void CodeGenTileLangNPUIRAPI::UpdateMLIRValueMap(const mlir::Value key, mlir::Value val){
+inline void CodeGenTileLangNPUIRAPI::UpdateMLIRValueMap(const mlir::Value key,
+                                                        mlir::Value val) {
   mlir::Block *curr_block = builder.getInsertionBlock();
   this->mlir_value_map[{key, curr_block}] = val;
 }
 
-inline std::pair<bool, mlir::Value> CodeGenTileLangNPUIRAPI::CheckPrimExprMap(const PrimExprNode * op){
+inline std::pair<bool, mlir::Value>
+CodeGenTileLangNPUIRAPI::CheckPrimExprMap(const PrimExprNode *op) {
   mlir::Block *curr_block = builder.getInsertionBlock();
   auto it = this->prim_expr_map.find({GetRef<PrimExpr>(op), curr_block});
   if (it != this->prim_expr_map.end()) {
@@ -1119,7 +1002,8 @@ inline std::pair<bool, mlir::Value> CodeGenTileLangNPUIRAPI::CheckPrimExprMap(co
   return std::pair(false, mlir::Value());
 }
 
-inline void CodeGenTileLangNPUIRAPI::UpdatePrimExprMap(const PrimExprNode * key, mlir::Value val){
+inline void CodeGenTileLangNPUIRAPI::UpdatePrimExprMap(const PrimExprNode *key,
+                                                       mlir::Value val) {
   mlir::Block *curr_block = builder.getInsertionBlock();
   this->prim_expr_map[{GetRef<PrimExpr>(key), curr_block}] = val;
 }
@@ -1145,15 +1029,318 @@ mlir::Value CodeGenTileLangNPUIRAPI::BinaryOpCodegen(const PrimExprNode *op,
   }
   mlir::Value mlirVal;
   if constexpr (std::is_same_v<U, std::nullptr_t>) {
-      // create binary arithmetic operations
-      mlirVal = builder.create<T>(builder.getUnknownLoc(), lhs, rhs);
+    // create binary arithmetic operations
+    mlirVal = builder.create<T>(builder.getUnknownLoc(), lhs, rhs);
   } else {
-      // create binary comparison operations
-      assert(mode != nullptr && "Mode must not be nullptr!");
-      mlirVal = builder.create<T>(builder.getUnknownLoc(), mode, lhs, rhs);
+    // create binary comparison operations
+    assert(mode != nullptr && "Mode must not be nullptr!");
+    mlirVal = builder.create<T>(builder.getUnknownLoc(), mode, lhs, rhs);
   }
   UpdatePrimExprMap(op, mlirVal);
   return mlirVal;
+}
+
+static int64_t ExtractStaticShapeDim(mlir::OpFoldResult ofr) {
+  if (auto attr = ofr.dyn_cast<mlir::Attribute>()) {
+    if (auto intAttr = attr.dyn_cast<mlir::IntegerAttr>()) {
+      return intAttr.getInt();
+    }
+  }
+  return mlir::ShapedType::kDynamic;
+}
+
+static mlir::Value MaterializeIndexFoldResult(mlir::OpBuilder &builder,
+                                              mlir::Location loc,
+                                              mlir::OpFoldResult ofr) {
+  if (auto attr = ofr.dyn_cast<mlir::Attribute>()) {
+    return builder.create<mlir::arith::ConstantIndexOp>(
+        loc, attr.cast<mlir::IntegerAttr>().getInt());
+  }
+  mlir::Value val = ofr.get<mlir::Value>();
+  if (!val.getType().isIndex()) {
+    val = builder.create<mlir::arith::IndexCastOp>(loc, builder.getIndexType(),
+                                                   val);
+  }
+  return val;
+}
+
+static mlir::OpFoldResult ComputeProjectedViewOffset(
+    mlir::OpBuilder &builder, mlir::Location loc, int64_t baseLayoutOffset,
+    llvm::ArrayRef<mlir::OpFoldResult> sliceOffsets,
+    llvm::ArrayRef<mlir::OpFoldResult> baseLayoutStrides) {
+  ICHECK(sliceOffsets.size() == baseLayoutStrides.size());
+  int64_t staticOffset = baseLayoutOffset;
+  mlir::Value dynamicOffset;
+
+  for (size_t i = 0; i < sliceOffsets.size(); ++i) {
+    auto offAttr = sliceOffsets[i].dyn_cast<mlir::Attribute>();
+    auto strideAttr = baseLayoutStrides[i].dyn_cast<mlir::Attribute>();
+    if (offAttr && strideAttr) {
+      staticOffset += offAttr.cast<mlir::IntegerAttr>().getInt() *
+                      strideAttr.cast<mlir::IntegerAttr>().getInt();
+      continue;
+    }
+
+    if (offAttr && offAttr.cast<mlir::IntegerAttr>().getInt() == 0) {
+      continue;
+    }
+
+    mlir::Value term =
+        MaterializeIndexFoldResult(builder, loc, sliceOffsets[i]);
+    if (!strideAttr || strideAttr.cast<mlir::IntegerAttr>().getInt() != 1) {
+      mlir::Value strideVal =
+          MaterializeIndexFoldResult(builder, loc, baseLayoutStrides[i]);
+      term = builder.create<mlir::arith::MulIOp>(loc, term, strideVal);
+    }
+    dynamicOffset =
+        dynamicOffset
+            ? builder.create<mlir::arith::AddIOp>(loc, dynamicOffset, term)
+            : term;
+  }
+
+  if (!dynamicOffset) {
+    return builder.getIndexAttr(staticOffset);
+  }
+
+  if (staticOffset != 0) {
+    mlir::Value staticOffsetVal =
+        builder.create<mlir::arith::ConstantIndexOp>(loc, staticOffset);
+    dynamicOffset = builder.create<mlir::arith::AddIOp>(loc, staticOffsetVal,
+                                                        dynamicOffset);
+  }
+  return dynamicOffset;
+}
+
+CodeGenTileLangNPUIRAPI::SliceFacts
+CodeGenTileLangNPUIRAPI::BuildSliceFacts(Buffer buffer_data,
+                                         Array<Range> range) {
+  SliceFacts facts;
+  facts.baseMemref = GetVarValue(buffer_data->data.get());
+  facts.baseMemrefType =
+      facts.baseMemref.getType().dyn_cast<mlir::MemRefType>();
+  // Generic T.copy only reasons about memref views in the default path.
+  ICHECK(facts.baseMemrefType)
+      << "generic T.copy only supports memref operands in the default path.";
+
+  auto layoutAttr =
+      facts.baseMemrefType.getLayout().dyn_cast<mlir::StridedLayoutAttr>();
+  // The projected-layout path expects offset/stride metadata in strided form.
+  ICHECK(layoutAttr)
+      << "generic T.copy only supports strided memref operands in the default "
+         "path.";
+  // Slice offsets may be dynamic, but the base memref layout itself must have a
+  // fixed starting point so the projected view offset stays well-defined.
+  ICHECK(!mlir::ShapedType::isDynamic(layoutAttr.getOffset()))
+      << "generic T.copy requires a statically-known base layout offset.";
+  // Keep the generic path intentionally narrow: contiguous buffers only.
+  ICHECK(buffer_data->strides.empty())
+      << "generic T.copy only supports contiguous buffers; explicit buffer "
+         "strides are unsupported.";
+
+  facts.baseLayoutOffset = layoutAttr.getOffset();
+  llvm::SmallVector<PrimExpr> shapeExprs(buffer_data->shape.begin(),
+                                         buffer_data->shape.end());
+  llvm::SmallVector<PrimExpr> strideExprs =
+      BuildContiguousStrideExprs(shapeExprs);
+  facts.baseLayoutStrides = ExtractStaticInts(strideExprs);
+  facts.baseLayoutStrideValues = BuildIndexFoldResultsFromExprs(
+      builder, strideExprs, [this](PrimExpr expr) {
+        mlir::Value value = MakeValue(expr);
+        return value.getType().isIndex() ? value : CreateIndexCastOp(value);
+      });
+
+  Array<PrimExpr> region_shape, region_indices;
+  for (Range r : range) {
+    region_shape.push_back(r->extent);
+    region_indices.push_back(r->min);
+    if (auto s_int = as_const_int(r->min)) {
+      facts.sliceOffsets.push_back(builder.getIndexAttr(*s_int));
+    } else {
+      facts.sliceOffsets.push_back(CreateIndexCastOp(MakeValue(r->min)));
+    }
+    if (auto s_int = as_const_int(r->extent)) {
+      facts.sliceSizes.push_back(builder.getIndexAttr(*s_int));
+    } else {
+      facts.sliceSizes.push_back(CreateIndexCastOp(MakeValue(r->extent)));
+    }
+  }
+
+  // Region rank and base memref rank must match because the default path always
+  // builds a full-rank subview before reinterpreting the aligned copy view.
+  ICHECK(static_cast<int64_t>(facts.sliceOffsets.size()) ==
+         facts.baseMemrefType.getRank())
+      << "generic T.copy expects range rank to match base memref rank.";
+  // The contiguous stride model must produce one stride per original slice dim.
+  ICHECK(facts.baseLayoutStrides.size() == facts.sliceOffsets.size())
+      << "generic T.copy expects buffer rank to match inferred layout rank.";
+  facts.coversWholeBuffer =
+      IsEqual(buffer_data->shape, region_shape) && AllZero(region_indices);
+  return facts;
+}
+
+CodeGenTileLangNPUIRAPI::CopyShapePlan
+CodeGenTileLangNPUIRAPI::BuildCopyShapePlan(const SliceFacts &src,
+                                            const SliceFacts &dst) {
+  struct ShapeExtract {
+    llvm::SmallVector<int64_t> backbone;
+    llvm::SmallVector<unsigned> backboneIdx;
+    std::vector<llvm::SmallVector<unsigned>> gapIdx;
+  };
+
+  auto extract = [](llvm::ArrayRef<mlir::OpFoldResult> sizes) {
+    ShapeExtract info;
+    info.gapIdx.emplace_back();
+    for (unsigned i = 0; i < sizes.size(); ++i) {
+      int64_t dim = ExtractStaticShapeDim(sizes[i]);
+      if (dim == 1) {
+        info.gapIdx.back().push_back(i);
+      } else {
+        info.backbone.push_back(dim);
+        info.backboneIdx.push_back(i);
+        info.gapIdx.emplace_back();
+      }
+    }
+    return info;
+  };
+
+  auto srcInfo = extract(src.sliceSizes);
+  auto dstInfo = extract(dst.sliceSizes);
+
+  // After removing static-1 gaps, src and dst must expose the same number of
+  // backbone dimensions to be alignable at all.
+  ICHECK(srcInfo.backbone.size() == dstInfo.backbone.size())
+      << "generic T.copy backbone mismatch: src has " << srcInfo.backbone.size()
+      << " non-singleton dims, dst has " << dstInfo.backbone.size()
+      << " non-singleton dims.";
+
+  CopyShapePlan plan;
+  for (size_t i = 0; i < srcInfo.backbone.size(); ++i) {
+    int64_t srcDim = srcInfo.backbone[i];
+    int64_t dstDim = dstInfo.backbone[i];
+    bool srcDyn = mlir::ShapedType::isDynamic(srcDim);
+    bool dstDyn = mlir::ShapedType::isDynamic(dstDim);
+    // Each aligned backbone slot must agree statically, unless at least one
+    // side stays dynamic and we carry that uncertainty into the aligned shape.
+    ICHECK(srcDyn || dstDyn || srcDim == dstDim)
+        << "generic T.copy backbone dimension mismatch at position " << i
+        << ": src=" << srcDim << ", dst=" << dstDim;
+
+    size_t targetGap =
+        std::min(srcInfo.gapIdx[i].size(), dstInfo.gapIdx[i].size());
+    for (size_t j = 0; j < targetGap; ++j) {
+      size_t srcIdx = srcInfo.gapIdx[i].size() - targetGap + j;
+      size_t dstIdx = dstInfo.gapIdx[i].size() - targetGap + j;
+      plan.alignedShape.push_back(1);
+      plan.srcKeptDims.push_back(srcInfo.gapIdx[i][srcIdx]);
+      plan.dstKeptDims.push_back(dstInfo.gapIdx[i][dstIdx]);
+    }
+
+    plan.alignedShape.push_back(srcDyn || dstDyn ? mlir::ShapedType::kDynamic
+                                                 : srcDim);
+    plan.srcKeptDims.push_back(srcInfo.backboneIdx[i]);
+    plan.dstKeptDims.push_back(dstInfo.backboneIdx[i]);
+  }
+
+  size_t trailingGap =
+      std::min(srcInfo.gapIdx.back().size(), dstInfo.gapIdx.back().size());
+  for (size_t j = 0; j < trailingGap; ++j) {
+    plan.alignedShape.push_back(1);
+    plan.srcKeptDims.push_back(srcInfo.gapIdx.back()[j]);
+    plan.dstKeptDims.push_back(dstInfo.gapIdx.back()[j]);
+  }
+
+  if (plan.alignedShape.empty()) {
+    // Scalar-like copies still need one representative singleton dimension so
+    // the generic path can materialize a legal memref.copy view.
+    ICHECK(!srcInfo.gapIdx.empty() && !srcInfo.gapIdx.front().empty() &&
+           !dstInfo.gapIdx.empty() && !dstInfo.gapIdx.front().empty())
+        << "generic T.copy could not derive a valid target shape.";
+    plan.alignedShape.push_back(1);
+    plan.srcKeptDims.push_back(srcInfo.gapIdx.front().front());
+    plan.dstKeptDims.push_back(dstInfo.gapIdx.front().front());
+  }
+
+  // Every aligned dimension must correspond to exactly one kept source dim and
+  // one kept destination dim.
+  ICHECK(plan.alignedShape.size() == plan.srcKeptDims.size() &&
+         plan.alignedShape.size() == plan.dstKeptDims.size())
+      << "generic T.copy internal error: target shape / kept-dim mismatch.";
+  return plan;
+}
+
+CodeGenTileLangNPUIRAPI::ProjectedLayoutPlan
+CodeGenTileLangNPUIRAPI::BuildProjectedLayoutPlan(
+    const SliceFacts &facts, llvm::ArrayRef<unsigned> keptDims,
+    llvm::ArrayRef<int64_t> alignedShape) {
+  // The shape-alignment phase decides the projected rank; layout projection
+  // must consume exactly that many kept dimensions.
+  ICHECK(keptDims.size() == alignedShape.size())
+      << "generic T.copy internal error: projected rank mismatch.";
+
+  ProjectedLayoutPlan layout;
+  layout.viewStrideStatics.reserve(keptDims.size());
+  layout.viewStrideValues.reserve(keptDims.size());
+  layout.viewSizes.reserve(keptDims.size());
+  for (size_t i = 0; i < keptDims.size(); ++i) {
+    unsigned idx = keptDims[i];
+    // Each kept dim must refer back to a valid original slice/base-layout dim.
+    ICHECK(idx < facts.baseLayoutStrides.size() &&
+           idx < facts.sliceSizes.size())
+        << "generic T.copy internal error: kept index out of range.";
+    // Dynamic projected strides are valid for contiguous buffers. We keep a
+    // static-or-dynamic type view for memref metadata plus the runtime stride
+    // values needed by reinterpret_cast operands.
+    layout.viewStrideStatics.push_back(facts.baseLayoutStrides[idx]);
+    layout.viewStrideValues.push_back(facts.baseLayoutStrideValues[idx]);
+    layout.viewSizes.push_back(facts.sliceSizes[idx]);
+  }
+
+  // All original slice offsets contribute to the final view start, including
+  // dimensions later dropped from the aligned rank.
+  layout.viewOffset = ComputeProjectedViewOffset(
+      builder, builder.getUnknownLoc(), facts.baseLayoutOffset,
+      facts.sliceOffsets, facts.baseLayoutStrideValues);
+  return layout;
+}
+
+mlir::Value
+CodeGenTileLangNPUIRAPI::BuildFullRankSubview(const SliceFacts &facts) {
+  if (facts.coversWholeBuffer) {
+    return facts.baseMemref;
+  }
+
+  llvm::SmallVector<mlir::OpFoldResult> unitStrides(facts.sliceOffsets.size(),
+                                                    builder.getIndexAttr(1));
+  return builder.create<mlir::memref::SubViewOp>(
+      builder.getUnknownLoc(), facts.baseMemref, facts.sliceOffsets,
+      facts.sliceSizes, unitStrides);
+}
+
+mlir::Value CodeGenTileLangNPUIRAPI::BuildAlignedCopyView(
+    mlir::Value fullSubview, mlir::Type elemTy, mlir::Attribute memSpace,
+    llvm::ArrayRef<int64_t> alignedShape, const ProjectedLayoutPlan &layout) {
+  auto getTypeOffset = [](mlir::OpFoldResult ofr) -> int64_t {
+    if (auto attr = ofr.dyn_cast<mlir::Attribute>()) {
+      return attr.cast<mlir::IntegerAttr>().getInt();
+    }
+    return mlir::ShapedType::kDynamic;
+  };
+
+  auto targetLayout = mlir::StridedLayoutAttr::get(
+      builder.getContext(), getTypeOffset(layout.viewOffset),
+      layout.viewStrideStatics);
+  auto targetTy =
+      mlir::MemRefType::get(alignedShape, elemTy, targetLayout, memSpace);
+
+  if (fullSubview.getType() == targetTy) {
+    return fullSubview;
+  }
+
+  // The target type records which offset/stride positions stay dynamic; the
+  // reinterpret operands carry their concrete runtime values.
+  return builder.create<mlir::memref::ReinterpretCastOp>(
+      builder.getUnknownLoc(), targetTy, fullSubview, layout.viewOffset,
+      layout.viewSizes, layout.viewStrideValues);
 }
 
 /// Generate hivm.hir.load or hivm.hir.store for tl.copy.
@@ -1181,9 +1368,8 @@ void CodeGenTileLangNPUIRAPI::AscendCopyCodegen(const CallNode *op) {
     mlir::Value dst =
         GenRankReducedSubviewFromRegion(npuirop.dst, npuirop.dst_range);
     mlir::UnitAttr dst_continuous = builder.getUnitAttr();
-    builder.create<mlir::hivm::ND2NZOp>(builder.getUnknownLoc(),
-                                        mlir::TypeRange{}, src, dst,
-                                        dst_continuous);
+    builder.create<mlir::hivm::ND2NZOp>(
+        builder.getUnknownLoc(), mlir::TypeRange{}, src, dst, dst_continuous);
     return;
   }
 
@@ -1205,7 +1391,8 @@ void CodeGenTileLangNPUIRAPI::AscendCopyCodegen(const CallNode *op) {
     mlir::hivm::FixpipePreQuantMode pre_quant_mode =
         mlir::hivm::FixpipePreQuantMode::NO_QUANT;
     if (src_dtype != dst_dtype) {
-      if (src_dtype == DataType::Float(32) && dst_dtype == DataType::Float(16)) {
+      if (src_dtype == DataType::Float(32) &&
+          dst_dtype == DataType::Float(16)) {
         pre_quant_mode = mlir::hivm::FixpipePreQuantMode::F322F16;
       } else if (src_dtype == DataType::Float(32) &&
                  dst_dtype == DataType::BFloat(16)) {
@@ -1232,11 +1419,46 @@ void CodeGenTileLangNPUIRAPI::AscendCopyCodegen(const CallNode *op) {
     return;
   }
 
-  mlir::Value src_sub_view =
-      GenSubviewFromRegion(npuirop.src, npuirop.src_range);
-  mlir::Value dst_sub_view =
-      GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
-  SmartMemRefCopy(src_sub_view, dst_sub_view);
+  // Early dtype check: T.copy does not support element type casting.
+  ICHECK(npuirop.src->dtype == npuirop.dst->dtype)
+      << "T.copy does not support element type casting. ";
+
+  SliceFacts srcFacts = BuildSliceFacts(npuirop.src, npuirop.src_range);
+  SliceFacts dstFacts = BuildSliceFacts(npuirop.dst, npuirop.dst_range);
+  CopyShapePlan shapePlan = BuildCopyShapePlan(srcFacts, dstFacts);
+  ProjectedLayoutPlan srcLayout = BuildProjectedLayoutPlan(
+      srcFacts, shapePlan.srcKeptDims, shapePlan.alignedShape);
+  ProjectedLayoutPlan dstLayout = BuildProjectedLayoutPlan(
+      dstFacts, shapePlan.dstKeptDims, shapePlan.alignedShape);
+
+  mlir::Value srcFullSubview = BuildFullRankSubview(srcFacts);
+  mlir::Value dstFullSubview = BuildFullRankSubview(dstFacts);
+  mlir::Value srcAlignedView = BuildAlignedCopyView(
+      srcFullSubview, srcFacts.baseMemrefType.getElementType(),
+      srcFacts.baseMemrefType.getMemorySpace(), shapePlan.alignedShape,
+      srcLayout);
+  mlir::Value dstAlignedView = BuildAlignedCopyView(
+      dstFullSubview, dstFacts.baseMemrefType.getElementType(),
+      dstFacts.baseMemrefType.getMemorySpace(), shapePlan.alignedShape,
+      dstLayout);
+
+  auto src_ty = srcAlignedView.getType().cast<mlir::MemRefType>();
+  auto dst_ty = dstAlignedView.getType().cast<mlir::MemRefType>();
+  // memref.copy requires matching element type and logical shape, but the
+  // projected src/dst views may legitimately differ in memory space and
+  // physical layout (for example GM -> UB copies).
+  // If this fails, one of the earlier generic-copy planning stages produced
+  // incompatible view types for what should have been the same logical copy.
+  ICHECK(src_ty.getElementType() == dst_ty.getElementType())
+      << "generic T.copy internal error: src/dst projected views do not "
+         "share the same element type.";
+  // The aligned copy contract is defined in terms of logical shape equality,
+  // not full memref type equality.
+  ICHECK(src_ty.getShape() == dst_ty.getShape())
+      << "generic T.copy internal error: src/dst projected views do not "
+         "share the same logical shape.";
+  builder.create<mlir::memref::CopyOp>(builder.getUnknownLoc(), TypeRange{},
+                                       srcAlignedView, dstAlignedView);
 }
 
 template <typename T, typename U>
@@ -1247,10 +1469,10 @@ void CodeGenTileLangNPUIRAPI::UnaryVecOpCodegen(const CallNode *op) {
   auto dims = getBroadcastDim(npuirop.src->shape, npuirop.dst->shape);
   // Create HIVM Op
   builder.create<U>(builder.getUnknownLoc(), mlir::TypeRange{}, // result type
-                     mlir::ValueRange{in_data_name},              // in
-                     mlir::ValueRange{out_data_name},             // out
-                     builder.getDenseI64ArrayAttr({}),           // transpose
-                     builder.getDenseI64ArrayAttr(dims)          // broadcast
+                    mlir::ValueRange{in_data_name},             // in
+                    mlir::ValueRange{out_data_name},            // out
+                    builder.getDenseI64ArrayAttr({}),           // transpose
+                    builder.getDenseI64ArrayAttr(dims)          // broadcast
   );
 }
 
@@ -1259,7 +1481,7 @@ void CodeGenTileLangNPUIRAPI::BarrierCodegen(const CallNode *op) {
   mlir::hivm::PipeAttr pipAttrType = mlir::hivm::PipeAttr::get(
       builder.getContext(), PIPE_MAP[npuirop.pipe_type]);
   builder.create<mlir::hivm::PipeBarrierOp>(builder.getUnknownLoc(),
-                                             pipAttrType);
+                                            pipAttrType);
 }
 
 void CodeGenTileLangNPUIRAPI::VselectCodegen(const CallNode *op) {
@@ -1291,10 +1513,9 @@ void CodeGenTileLangNPUIRAPI::VbrcCodegen(const CallNode *op) {
   tvm::tl::NpuirBrc npuirop(op->args, this->vmap);
   mlir::Value src;
   llvm::ArrayRef<int64_t> inBufferShape;
-  bool isScalar =
-      !npuirop.in.as<tvm::tir::Buffer>() &&
-      !npuirop.in.as<tvm::tir::BufferRegion>() &&
-      !npuirop.in.as<tvm::tir::CallNode>();
+  bool isScalar = !npuirop.in.as<tvm::tir::Buffer>() &&
+                  !npuirop.in.as<tvm::tir::BufferRegion>() &&
+                  !npuirop.in.as<tvm::tir::CallNode>();
   if (isScalar) {
     // Scalar case
     if (npuirop.in->dtype != npuirop.dst->dtype) {
@@ -1315,8 +1536,8 @@ void CodeGenTileLangNPUIRAPI::VbrcCodegen(const CallNode *op) {
     auto broadcastDim = getBroadcastDim(inBufferShape, outBufferShape);
     broadcastDimAttr = builder.getDenseI64ArrayAttr(broadcastDim);
   }
-  builder.create<mlir::hivm::VBrcOp>(builder.getUnknownLoc(), TypeRange{},
-                                      src, dst, broadcastDimAttr);
+  builder.create<mlir::hivm::VBrcOp>(builder.getUnknownLoc(), TypeRange{}, src,
+                                     dst, broadcastDimAttr);
 }
 
 void CodeGenTileLangNPUIRAPI::VcastCodegen(const CallNode *op) {
@@ -1370,8 +1591,8 @@ void CodeGenTileLangNPUIRAPI::VcumsumCodegen(const CallNode *op) {
   Value src = GenSubviewFromRegion(npuirop.src, npuirop.src_range);
   Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
   auto reverse_mode = npuirop.reverse;
-  if(reverse_mode == true){
-    ICHECK(false) <<"reverse=True is not yet supported\n";
+  if (reverse_mode == true) {
+    ICHECK(false) << "reverse=True is not yet supported\n";
     return;
   }
   // builder.create<mlir::hivm::VCumsumOp>(
@@ -1382,28 +1603,34 @@ void CodeGenTileLangNPUIRAPI::VcumsumCodegen(const CallNode *op) {
       loc, TypeRange{}, src, dst, builder.getDenseI64ArrayAttr(npuirop.cum_dims), booleanAttr);
 }
 
-void CodeGenTileLangNPUIRAPI::VsigmoidCodegen(const tvm::tir::CallNode* op) {
+void CodeGenTileLangNPUIRAPI::VsigmoidCodegen(const tvm::tir::CallNode *op) {
   tvm::tl::NpuirSigmoid npuirop(op->args, this->vmap);
   Value src = GenSubviewFromRegion(npuirop.src, npuirop.src_range);
   Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
   auto dst_type = dst.getType().cast<mlir::RankedTensorType>();
   auto elem_type = dst_type.getElementType();
   mlir::Location loc = builder.getUnknownLoc();
-  Value tmp = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elem_type);
-  Value zero = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elem_type, 0.0f));
-  Value one = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elem_type, 1.0f));
+  Value tmp = mlir::utils::createTmpBufferOrTensorWithTargetType(
+      builder, loc, src, elem_type);
+  Value zero = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elem_type, 0.0f));
+  Value one = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elem_type, 1.0f));
 
   // Step 1 src = 0 - src
-  builder.create<mlir::hivm::VSubOp>(loc, TypeRange{}, ValueRange{zero, src}, ValueRange{tmp});
+  builder.create<mlir::hivm::VSubOp>(loc, TypeRange{}, ValueRange{zero, src},
+                                     ValueRange{tmp});
   // Step 2: src = exp(src)
-  builder.create<mlir::hivm::VExpOp>(loc, mlir::TypeRange{},
-      mlir::ValueRange{tmp}, mlir::ValueRange{tmp});
+  builder.create<mlir::hivm::VExpOp>(
+      loc, mlir::TypeRange{}, mlir::ValueRange{tmp}, mlir::ValueRange{tmp});
   // Step 3: src = src + 1
   builder.create<mlir::hivm::VAddOp>(loc, mlir::TypeRange{},
-      mlir::ValueRange{tmp, one}, mlir::ValueRange{tmp});
+                                     mlir::ValueRange{tmp, one},
+                                     mlir::ValueRange{tmp});
   // Step 4: dst = 1 / src
   builder.create<mlir::hivm::VDivOp>(loc, mlir::TypeRange{},
-      mlir::ValueRange{one, tmp}, mlir::ValueRange{dst});
+                                     mlir::ValueRange{one, tmp},
+                                     mlir::ValueRange{dst});
 }
 
 void CodeGenTileLangNPUIRAPI::VAtomicAddCodegen(const CallNode *op) {
@@ -1417,12 +1644,8 @@ void CodeGenTileLangNPUIRAPI::VAtomicAddCodegen(const CallNode *op) {
   Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
 
   // create StoreOp
-  auto newStoreOp = builder.create<hivm::StoreOp>(
-      builder.getUnknownLoc(),
-      TypeRange{},
-      src,
-      dst
-  );
+  auto newStoreOp = builder.create<hivm::StoreOp>(builder.getUnknownLoc(),
+                                                  TypeRange{}, src, dst);
   hivm::AtomicKind hvAtomicKind = hivm::AtomicKind::ADD;
   newStoreOp.setAtomicKind(hvAtomicKind);
 }
@@ -1486,13 +1709,12 @@ void CodeGenTileLangNPUIRAPI::VarangeCodegen(const CallNode *op) {
   Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
 
   Value offsetVal = MakeValue(npuirop.offset);
-  Value offset = offsetVal.getType().isIndex()
-    ? offsetVal
-    : CreateIndexCastOp(offsetVal);
+  Value offset =
+      offsetVal.getType().isIndex() ? offsetVal : CreateIndexCastOp(offsetVal);
   llvm::SmallVector<Value> strides;
   for (auto st : npuirop.strides) {
     Value stride = MakeValue(st);
-    if(!stride.getType().isIndex()) {
+    if (!stride.getType().isIndex()) {
       stride = CreateIndexCastOp(stride);
     }
     strides.push_back(stride);
@@ -1558,8 +1780,8 @@ void CodeGenTileLangNPUIRAPI::Nd2NzCodegen(const CallNode *op) {
   // gen memref.subview
   // src is GM: ensure min_rank=2 to maintain consistent GM rank across all
   // nd2nz calls in the same function, preventing callee signature mismatches.
-  mlir::Value src =
-      GenRankReducedSubviewFromRegion(npuirop.src, npuirop.src_range, /*min_rank=*/2);
+  mlir::Value src = GenRankReducedSubviewFromRegion(
+      npuirop.src, npuirop.src_range, /*min_rank=*/2);
   // dst is cbuf: downstream will cast to 4D, so no min_rank needed.
   mlir::Value dst =
       GenRankReducedSubviewFromRegion(npuirop.dst, npuirop.dst_range);
@@ -1570,7 +1792,7 @@ void CodeGenTileLangNPUIRAPI::Nd2NzCodegen(const CallNode *op) {
   mlir::UnitAttr dst_continuous =
       npuirop.dst_continuous ? builder.getUnitAttr() : mlir::UnitAttr();
   builder.create<mlir::hivm::ND2NZOp>(unknown_loc, res, src, dst,
-                                       dst_continuous);
+                                      dst_continuous);
 }
 
 void CodeGenTileLangNPUIRAPI::Nz2NdCodegen(const CallNode *op) {
@@ -1594,8 +1816,8 @@ void CodeGenTileLangNPUIRAPI::FixpipeCodegen(const CallNode *op) {
       GenRankReducedSubviewFromRegion(npuirop.src, npuirop.src_range);
   // dst is GM: ensure min_rank=2 to maintain consistent GM rank across all
   // fixpipe calls in the same function, preventing callee signature mismatches.
-  mlir::Value dst =
-      GenRankReducedSubviewFromRegion(npuirop.dst, npuirop.dst_range, /*min_rank=*/2);
+  mlir::Value dst = GenRankReducedSubviewFromRegion(
+      npuirop.dst, npuirop.dst_range, /*min_rank=*/2);
 
   // gen hivm.hir.fixpipe
   mlir::Location unknown_loc = builder.getUnknownLoc();
@@ -1648,22 +1870,52 @@ void CodeGenTileLangNPUIRAPI::DotCodegen(const CallNode *op) {
   //                 outs(%alloc_9 : memref<128x64xf32,
   //                      #hivm.address_space<cc>>)
   tvm::tl::NpuirDot npuirop(op->args, this->vmap);
-  Array<PrimExpr> a_region_shape, b_region_shape;
-  for (int i = 0; i < npuirop.src0_range.size(); i++) {
-    a_region_shape.push_back(npuirop.src0_range[i].get()->extent);
-    b_region_shape.push_back(npuirop.src1_range[i].get()->extent);
-  }
+  auto extract_region_shape =
+      [](const Array<Range> &ranges) -> Array<PrimExpr> {
+    Array<PrimExpr> region_shape;
+    for (int i = ranges.size() - 2; i < ranges.size(); ++i) {
+      region_shape.push_back(ranges[i].get()->extent);
+    }
+    return region_shape;
+  };
+  auto a_region_shape = extract_region_shape(npuirop.src0_range);
+  auto b_region_shape = extract_region_shape(npuirop.src1_range);
 
   mlir::Location unknown_loc = builder.getUnknownLoc();
   mlir::IndexType idx_ty = builder.getIndexType();
-  mlir::Value a = GetVarValue(npuirop.src0->data.get());
-  mlir::Value b = GetVarValue(npuirop.src1->data.get());
-  mlir::Value c = GetVarValue(npuirop.dst->data.get());
+  mlir::Value a, b, c;
+  if (npuirop.src0_range.size() > 2) {
+    a = GenRankReducedSubviewFromRegion(npuirop.src0, npuirop.src0_range, 2);
+  } else {
+    a = GetVarValue(npuirop.src0->data.get());
+  }
+  if (npuirop.src1_range.size() > 2) {
+    b = GenRankReducedSubviewFromRegion(npuirop.src1, npuirop.src1_range, 2);
+  } else {
+    b = GetVarValue(npuirop.src1->data.get());
+  }
+  if (npuirop.dst_range.size() > 2) {
+    c = GenRankReducedSubviewFromRegion(npuirop.dst, npuirop.dst_range, 2);
+  } else {
+    c = GetVarValue(npuirop.dst->data.get());
+  }
   mlir::TypeRange result_tensors = {};
   mlir::Value init_condition = MakeValue(npuirop.initC);
-  mlir::Value real_m = CreateIndexCastOp(MakeValue(a_region_shape[0]));
-  mlir::Value real_k = CreateIndexCastOp(MakeValue(b_region_shape[0]));
-  mlir::Value real_n = CreateIndexCastOp(MakeValue(b_region_shape[1]));
+
+  int m_idx = npuirop.a_transpose ? 1 : 0;
+  int k_a_idx = npuirop.a_transpose ? 0 : 1;
+  int k_b_idx = npuirop.b_transpose ? 1 : 0;
+  int n_idx = npuirop.b_transpose ? 0 : 1;
+  ICHECK(analyzer_->CanProveEqual(a_region_shape[k_a_idx],
+                                  b_region_shape[k_b_idx]))
+      << "matmul inner dimension mismatch: "
+      << "a" << (npuirop.a_transpose ? ".T" : "")
+      << " K = " << a_region_shape[k_a_idx] << ", b"
+      << (npuirop.b_transpose ? ".T" : "")
+      << " K = " << b_region_shape[k_b_idx];
+  mlir::Value real_m = CreateIndexCastOp(MakeValue(a_region_shape[m_idx]));
+  mlir::Value real_k = CreateIndexCastOp(MakeValue(a_region_shape[k_a_idx]));
+  mlir::Value real_n = CreateIndexCastOp(MakeValue(b_region_shape[n_idx]));
   mlir::Value per_channel_bias = mlir::Value{};
   mlir::UnitAttr a_transpose =
       npuirop.a_transpose ? builder.getUnitAttr() : mlir::UnitAttr();
@@ -1702,86 +1954,129 @@ void CodeGenTileLangNPUIRAPI::BitcastCodegen(const CallNode *op) {
   }
 }
 
-mlir::Value CodeGenTileLangNPUIRAPI::GenMemrefLoadFromRegion(const BufferLoadNode *op) {
-  auto buffer = op->buffer;
-  auto indices = op->indices;
-
-  // Check pre-conditions
-  if (op->dtype.lanes() != 1) {
-    LOG(FATAL) << "lanes not one";
-  }
-  if (op->dtype != buffer->dtype) {
-    LOG(FATAL) << "The load type and buffer element type do not match";
-  }
-
+mlir::Value
+CodeGenTileLangNPUIRAPI::GenMemrefLoadFromRegion(Buffer buffer_data,
+                                                 Array<Range> range) {
   // Convert buffer from Buffer in TIR 2 memref in MLIR
-  auto mem = GetVarValue(buffer->data.get());
+  auto mem = GetVarValue(buffer_data->data.get());
 
   // Convert index from PrimExpr in TIR 2 index type in MLIR
   SmallVector<mlir::Value> convert_inds;
-  for (auto index : indices) {
-    mlir::Value indexVal = CreateIndexCastOp(MakeValue(index));
+  for (auto r : range) {
+    ICHECK(analyzer_->CanProveEqual(r->extent, 1))
+        << "Extent of range must be 1 or the memref.load should not be used.";
+    mlir::Value indexVal = CreateIndexCastOp(MakeValue(r->min));
     convert_inds.push_back(indexVal);
   }
 
   // Create memef.load op in MLIR
-  return builder.create<mlir::memref::LoadOp>(builder.getUnknownLoc(), mem, convert_inds);
+  return builder.create<mlir::memref::LoadOp>(builder.getUnknownLoc(), mem,
+                                              convert_inds);
 }
 
 template <typename T>
 void CodeGenTileLangNPUIRAPI::CreateHIVMBinaryVectorOp(const CallNode *op) {
-  auto processImm = [&](mlir::Value &src, int arg_id,
-                        Array<PrimExpr> &buffer_shape) {
-    if (op->args[arg_id].as<IntImm>() || op->args[arg_id].as<FloatImm>() || 
-        op->args[arg_id].as<tir::VarNode>()) {
+  tvm::tl::NpuirBinaryOperator binaryOp(op->args, this->vmap);
+  ICHECK(binaryOp.Dst().IsTensor())
+      << "The dst of a binary vector operator cannot be a scalar.";
+  // `enableScaler{Name}` is a flag used to determine whether to allow
+  // optimizing a 1x1 tensor into a scalar. If the Op does not accept this
+  // operand as a scalar or another operand is already a scalar, then this
+  // flag should be set to false.
+  bool enableScalerSrc0 = binaryOp.Src1().IsTensor();
+  if constexpr (T::template hasTrait<OpTrait::VectorOnlyTrait<0>::Impl>()) {
+    ICHECK(binaryOp.Src0().IsTensor())
+        << "The first operand of \"" << T::getOperationName().str()
+        << "\" cannot be a scalar.";
+    enableScalerSrc0 = false;
+  }
+  bool enableScalerSrc1 = binaryOp.Src0().IsTensor();
+  if constexpr (T::template hasTrait<OpTrait::VectorOnlyTrait<1>::Impl>()) {
+    ICHECK(binaryOp.Src1().IsTensor())
+        << "The second operand of \"" << T::getOperationName().str()
+        << "\" cannot be a scalar.";
+    enableScalerSrc1 = false;
+  }
+  ICHECK(binaryOp.Src0().IsTensor() || binaryOp.Src1().IsTensor())
+      << "Binary Vector Ops does not support cases where both input operands "
+         "are scalars.";
+  // src_dtype is used to unify the type of input operands.
+  DataType src_dtype;
+  if (binaryOp.Src0().IsTensor()) {
+    src_dtype = binaryOp.Src0().GetBuffer()->dtype;
+    if constexpr (T::template hasTrait<OpTrait::SameOperandsElementType>()) {
+      if (binaryOp.Src1().IsTensor()) {
+        ICHECK(src_dtype == binaryOp.Src1().GetBuffer()->dtype)
+            << "The element types of two operands should be the same for \""
+            << T::getOperationName().str() << '\"';
+      }
+    }
+  } else {
+    src_dtype = binaryOp.Src1().GetBuffer()->dtype;
+  }
+
+  mlir::Value src0, src1, dst;
+  llvm::ArrayRef<long int> shapeSrc0, shapeSrc1;
+  // rank_min is used to record the minimum rank of tensor type operands.
+  size_t rank_min = binaryOp.Dst().GetRanges().size();
+  auto PreProcessInput = [this, &rank_min, &src_dtype](
+                             mlir::Value &v, const tl::NpuirOperand &operand,
+                             const bool enableScaler) -> bool {
+    if (operand.IsScalar()) {
       // Scalar case
-      const CallNode *region_node = op->args[1 - arg_id].as<CallNode>();
-      const BufferLoadNode *buffer_load_node =
-          region_node->args[0].as<BufferLoadNode>();
-      if (op->args[arg_id]->dtype != buffer_load_node->buffer->dtype) {
-        src = ScalarConvertType(op->args[arg_id],
-                                buffer_load_node->buffer->dtype);
+      auto this_dtype = operand.GetExpr()->dtype;
+      if (this_dtype != src_dtype) {
+        v = ScalarConvertType(operand.GetExpr(), src_dtype);
       } else {
-        src = MakeValue(op->args[arg_id]);
+        v = MakeValue(operand.GetExpr());
       }
     } else {
       // Vector case
-      const CallNode *region_node = op->args[arg_id].as<CallNode>();
-      auto buffer_node = region_node->args[0].as<BufferLoadNode>();
-      buffer_shape = buffer_node->buffer->shape;
-      bool is_scalar_load = true;
-      for (int i = 0; i < buffer_shape.size(); i++) {
-        const IntImmNode* int_imm = region_node->args[2 + i].as<IntImmNode>();
-        if (!int_imm || int_imm->value != 1) {
-          is_scalar_load = false;
+      bool is_scalar_load = enableScaler;
+      for (auto arrRanges = operand.GetRanges(); auto range : arrRanges) {
+        if (!is_scalar_load) {
           break;
         }
+        if (!analyzer_->CanProveEqual(range->extent, 1)) {
+          is_scalar_load = false;
+        }
       }
-      const IntImmNode* int_imm = region_node->args[2].as<IntImmNode>();
-      // If load only one element, do not use memref.subview, use memref.load as a scalar
-      if(is_scalar_load && arg_id == 1) {
-        src = GenMemrefLoadFromRegion(buffer_node);
-        // clear buffer_shape to unable broadcast
-        buffer_shape.clear();
+      if (is_scalar_load) {
+        v = GenMemrefLoadFromRegion(operand.GetBuffer(), operand.GetRanges());
       } else {
-        src = GenSubviewFromRegion(region_node);
+        rank_min = std::min(rank_min, operand.GetRanges().size());
+        return true;
       }
     }
+    return false;
   };
-  // src0 src1
-  mlir::Value src0, src1;
-  Array<PrimExpr> buffer_shape0, buffer_shape1;
-  processImm(src0, 0, buffer_shape0);
-  processImm(src1, 1, buffer_shape1);
-  // dst
-  const CallNode *region_node_dst = op->args[2].as<CallNode>();
-  // Result will always be a vector. No need to add scalar check.
-  mlir::Value dst = GenSubviewFromRegion(region_node_dst);
+  auto ProcessTensor = [this, &rank_min](mlir::Value &v,
+                                         const tl::NpuirOperand &operand) {
+    if (rank_min != operand.GetRanges().size()) {
+      v = GenRankReducedSubviewFromRegion(operand.GetBuffer(),
+                                          operand.GetRanges(), rank_min);
+    } else {
+      v = GenSubviewFromRegion(operand.GetBuffer(), operand.GetRanges());
+    }
+  };
+  auto flag_src0_is_vec =
+      PreProcessInput(src0, binaryOp.Src0(), enableScalerSrc0);
+  auto flag_src1_is_vec =
+      PreProcessInput(src1, binaryOp.Src1(), enableScalerSrc1);
+  if (flag_src0_is_vec) {
+    ProcessTensor(src0, binaryOp.Src0());
+    shapeSrc0 = src0.getType().cast<MemRefType>().getShape();
+  }
+  if (flag_src1_is_vec) {
+    ProcessTensor(src1, binaryOp.Src1());
+    shapeSrc1 = src1.getType().cast<MemRefType>().getShape();
+  }
+  ProcessTensor(dst, binaryOp.Dst());
+
   // transpose
   mlir::DenseI64ArrayAttr transpose = builder.getDenseI64ArrayAttr({});
   // broadcast
-  llvm::SmallVector<int64_t> dims =
-      getBroadcastDim(buffer_shape0, buffer_shape1);
+  llvm::SmallVector<int64_t> dims = getBroadcastDim(shapeSrc0, shapeSrc1);
   mlir::DenseI64ArrayAttr broadcast = builder.getDenseI64ArrayAttr(dims);
   // Create hivm::op
   auto loc = builder.getUnknownLoc();
@@ -1847,8 +2142,8 @@ void CodeGenTileLangNPUIRAPI::SyncBlockCodegen(const T &sync_op) {
                 std::is_same_v<T, tvm::tl::NpuirSyncBlock>) {
     // Create HIVM SyncBlockWaitOp
     builder.create<mlir::hivm::SyncBlockWaitOp>(builder.getUnknownLoc(),
-                                                 coreAttrType, tPipAttrType,
-                                                 pipAttrType, flag_id);
+                                                coreAttrType, tPipAttrType,
+                                                pipAttrType, flag_id);
   }
 }
 
@@ -1862,10 +2157,10 @@ mlir::Value CodeGenTileLangNPUIRAPI::GetEventID(PrimExpr id) {
     mlir::IntegerType int64_type = builder.getI64Type();
     if (raw_type.is_int()) {
       i64_id = builder.create<mlir::arith::ExtSIOp>(unknown_loc, int64_type,
-                                                     origin_id);
+                                                    origin_id);
     } else {
       i64_id = builder.create<mlir::arith::ExtUIOp>(unknown_loc, int64_type,
-                                                     origin_id);
+                                                    origin_id);
     }
   }
   return i64_id;
@@ -1881,7 +2176,7 @@ void CodeGenTileLangNPUIRAPI::PipeFlagCodegen(const CallNode *op) {
       mlir::hivm::PipeAttr::get(builder.getContext(), PIPE_MAP[sync_op.pipe2]);
   mlir::Value event_id = GetEventID(sync_op.event_id);
   builder.create<U>(unknown_loc, set_pipe, wait_pipe, mlir::hivm::EventAttr{},
-                     event_id);
+                    event_id);
 }
 
 void CodeGenTileLangNPUIRAPI::DebugPrintCodegen(const CallNode *op) {
@@ -1902,7 +2197,7 @@ void CodeGenTileLangNPUIRAPI::DebugPrintCodegen(const CallNode *op) {
 
   mlir::Location unknown_loc = builder.getUnknownLoc();
   builder.create<mlir::hivm::DebugOp>(unknown_loc, "print", prefix, hex, arg,
-                                       mlir::hivm::TCoreTypeAttr{});
+                                      mlir::hivm::TCoreTypeAttr{});
 }
 
 void CodeGenTileLangNPUIRAPI::ReshapeCodegen(const CallNode *op) {
@@ -1915,96 +2210,31 @@ void CodeGenTileLangNPUIRAPI::ReshapeCodegen(const CallNode *op) {
   auto memSpace = srcTy.getMemorySpace();
 
   std::vector<tvm::PrimExpr> dstShape = npuirop.dst_shape;
-
-  SmallVector<tvm::PrimExpr> stridesVec;
-  stridesVec.reserve(dstShape.size());
-  tvm::PrimExpr strideExpr = tvm::Integer(1);
-  for (int i = static_cast<int>(dstShape.size()) - 1; i >= 0; --i) {
-    stridesVec.push_back(strideExpr);
-    strideExpr = strideExpr * dstShape[i];
-  }
-  std::reverse(stridesVec.begin(), stridesVec.end());
+  SmallVector<tvm::PrimExpr> stridesVec = BuildContiguousStrideExprs(dstShape);
 
   auto toIndexValue = [&](const tvm::PrimExpr &e) -> mlir::Value {
-    mlir::Value v = MakeValue(e);
-    if (!v.getType().isIndex()) {
-      v = builder.create<mlir::arith::IndexCastOp>(loc, builder.getIndexType(), v);
-    }
-    return v;
+    mlir::Value value = MakeValue(e);
+    return value.getType().isIndex() ? value : CreateIndexCastOp(value);
   };
 
-  bool allStatic = std::all_of(dstShape.begin(), dstShape.end(),
-      [](const tvm::PrimExpr &e) { return e.as<tvm::IntImmNode>() != nullptr; });
+  SmallVector<int64_t> dstShapeForType = ExtractStaticInts(dstShape);
+  SmallVector<int64_t> stridesForType = ExtractStaticInts(stridesVec);
 
-  SmallVector<int64_t> dstShapeForType;
-  dstShapeForType.reserve(dstShape.size());
-  for (auto s : dstShape) {
-    if (auto imm = s.as<tvm::IntImmNode>()) {
-      dstShapeForType.push_back(static_cast<int64_t>(imm->value));
-    } else {
-      dstShapeForType.push_back(mlir::ShapedType::kDynamic);
-    }
-  }
+  auto layoutAttr = mlir::StridedLayoutAttr::get(builder.getContext(),
+                                                 /*offset=*/0, stridesForType);
 
-  SmallVector<int64_t> stridesForType;
-  if (allStatic) {
-    stridesForType.reserve(dstShape.size());
-    int64_t stride = 1;
-    for (int i = static_cast<int>(dstShape.size()) - 1; i >= 0; --i) {
-      stridesForType.push_back(stride);
-      auto imm = dstShape[i].as<tvm::IntImmNode>();
-      stride *= imm->value;
-    }
-    std::reverse(stridesForType.begin(), stridesForType.end());
-  } else {
-    stridesForType.resize(dstShape.size(), mlir::ShapedType::kDynamic);
-  }
+  auto dstMemRefTy =
+      mlir::MemRefType::get(dstShapeForType, elemTy, layoutAttr, memSpace);
 
-  auto layoutAttr = mlir::StridedLayoutAttr::get(
-      builder.getContext(),
-      /*offset=*/0,
-      stridesForType);
-
-  auto dstMemRefTy = mlir::MemRefType::get(
-      dstShapeForType,
-      elemTy,
-      layoutAttr,
-      memSpace);
-
-  SmallVector<mlir::OpFoldResult> offsets;
-  offsets.reserve(dstShape.size());
-  for (size_t i = 0; i < dstShape.size(); ++i) {
-    offsets.push_back(builder.getIndexAttr(0));
-  }
-
-  SmallVector<mlir::OpFoldResult> sizes;
-  sizes.reserve(dstShape.size());
-  for (auto s : dstShape) {
-    if (allStatic) {
-      auto imm = s.as<tvm::IntImmNode>();
-      sizes.push_back(builder.getIndexAttr(imm->value));
-    } else {
-      sizes.push_back(toIndexValue(s));
-    }
-  }
-
-  SmallVector<mlir::OpFoldResult> strides;
-  strides.reserve(stridesVec.size());
-  for (size_t i = 0; i < stridesVec.size(); ++i) {
-    if (allStatic) {
-      strides.push_back(builder.getIndexAttr(stridesForType[i]));
-    } else {
-      strides.push_back(toIndexValue(stridesVec[i]));
-    }
-  }
+  SmallVector<mlir::OpFoldResult> offsets(dstShape.size(),
+                                          builder.getIndexAttr(0));
+  SmallVector<mlir::OpFoldResult> sizes =
+      BuildIndexFoldResultsFromExprs(builder, dstShape, toIndexValue);
+  SmallVector<mlir::OpFoldResult> strides =
+      BuildIndexFoldResultsFromExprs(builder, stridesVec, toIndexValue);
 
   mlir::Value reshaped = builder.create<mlir::memref::ReinterpretCastOp>(
-      loc,
-      dstMemRefTy,
-      src,
-      offsets,
-      sizes,
-      strides);
+      loc, dstMemRefTy, src, offsets, sizes, strides);
 
   var_map_[npuirop.dst->data.get()] = reshaped;
 }
@@ -2013,27 +2243,28 @@ void CodeGenTileLangNPUIRAPI::CallExternCodegen(const CallNode *op) {
   // Todo: Implementation pending
 }
 
-//Generate vector cosine approximation using polynomial expansion in codegen.
+// Generate vector cosine approximation using polynomial expansion in codegen.
 //
-//before(Tilelang/TIR semantic):
-//  Y = tl.npuir_vcos
-//  where cos(x) is approximated as:
-//    cos(x) ≈ 1 - 1/2*x^2 + 1/24*x^4 - 1/720*x^6
+// before(Tilelang/TIR semantic):
+//   Y = tl.npuir_vcos
+//   where cos(x) is approximated as:
+//     cos(x) ≈ 1 - 1/2*x^2 + 1/24*x^4 - 1/720*x^6
 //
-//after(MLIR Lowering):
-//  - materialize scalar constants (1,-1/2,1/24,-1/720)
-//  - compute x^2 x^4 x^6 via hivm::Vmul
-//  - scale each term with corresponding constant
-//  - accumulate terms using hivm::Vadd
-//  - store the final result into destination vector
-//  - all intermediate results are lowered to vector operations on memref subviews
+// after(MLIR Lowering):
+//   - materialize scalar constants (1,-1/2,1/24,-1/720)
+//   - compute x^2 x^4 x^6 via hivm::Vmul
+//   - scale each term with corresponding constant
+//   - accumulate terms using hivm::Vadd
+//   - store the final result into destination vector
+//   - all intermediate results are lowered to vector operations on memref
+//   subviews
 void CodeGenTileLangNPUIRAPI::VcosCodegen(const CallNode *op) {
   tvm::tl::NpuirVCos npuirop(op->args, this->vmap);
   auto loc = builder.getUnknownLoc();
 
   llvm::SmallVector<Value> srcs;
   size_t n_srcs = npuirop.srcs.size();
-  for (size_t i=0; i < n_srcs; i++) {
+  for (size_t i = 0; i < n_srcs; i++) {
     Value src = GenSubviewFromRegion(npuirop.srcs[i], npuirop.srcs_range[i]);
     srcs.push_back(src);
   }
@@ -2042,32 +2273,51 @@ void CodeGenTileLangNPUIRAPI::VcosCodegen(const CallNode *op) {
 
   auto srcType = srcs_vr[0].getType().cast<MemRefType>();
   mlir::Type elementType = srcType.getElementType();
-  Value one = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, 1.0f));
-  Value minusHalf = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, -0.5f));
-  Value twentyFour = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, 24.0f));
-  Value sevenTwenty = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, 720.0f));
-  Value minusOne = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, -1.0f));
+  Value one = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, 1.0f));
+  Value minusHalf = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, -0.5f));
+  Value twentyFour = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, 24.0f));
+  Value sevenTwenty = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, 720.0f));
+  Value minusOne = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, -1.0f));
   Value oneOver24 = builder.create<mlir::arith::DivFOp>(loc, one, twentyFour);
-  Value minusOneOver720 = builder.create<mlir::arith::DivFOp>(loc, minusOne, sevenTwenty);
+  Value minusOneOver720 =
+      builder.create<mlir::arith::DivFOp>(loc, minusOne, sevenTwenty);
 
   for (size_t i = 0; i < n_srcs; i++) {
     Value src = srcs[i];
-    Value x2 = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
-    Value x4 = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
-    Value x6 = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
-    Value tmp = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
+    Value x2 = mlir::utils::createTmpBufferOrTensorWithTargetType(
+        builder, loc, src, elementType);
+    Value x4 = mlir::utils::createTmpBufferOrTensorWithTargetType(
+        builder, loc, src, elementType);
+    Value x6 = mlir::utils::createTmpBufferOrTensorWithTargetType(
+        builder, loc, src, elementType);
+    Value tmp = mlir::utils::createTmpBufferOrTensorWithTargetType(
+        builder, loc, src, elementType);
 
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{src, src}, ValueRange{x2});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x2, x2}, ValueRange{x4});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x2, x4}, ValueRange{x6});
+    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{src, src},
+                                       ValueRange{x2});
+    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x2, x2},
+                                       ValueRange{x4});
+    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x2, x4},
+                                       ValueRange{x6});
 
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x2, minusHalf}, ValueRange{x2});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x4, oneOver24}, ValueRange{x4});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x6, minusOneOver720}, ValueRange{x6});
+    builder.create<mlir::hivm::VMulOp>(
+        loc, TypeRange{}, ValueRange{x2, minusHalf}, ValueRange{x2});
+    builder.create<mlir::hivm::VMulOp>(
+        loc, TypeRange{}, ValueRange{x4, oneOver24}, ValueRange{x4});
+    builder.create<mlir::hivm::VMulOp>(
+        loc, TypeRange{}, ValueRange{x6, minusOneOver720}, ValueRange{x6});
 
-    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x2, one}, ValueRange{tmp});
-    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x4, tmp}, ValueRange{tmp});
-    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x6, tmp}, ValueRange{dst});
+    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x2, one},
+                                       ValueRange{tmp});
+    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x4, tmp},
+                                       ValueRange{tmp});
+    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x6, tmp},
+                                       ValueRange{dst});
   }
 }
 
@@ -2079,19 +2329,21 @@ void CodeGenTileLangNPUIRAPI::VcosCodegen(const CallNode *op) {
 //     sin(x) ≈ x - 1/6*x^3 + 1/120*x^5 - 1/5040*x^7
 //
 // after(MLIR Lowering):
-//   - materialize scalar constants (1, -1, 6, 120, 5040) and compute coefficients
+//   - materialize scalar constants (1, -1, 6, 120, 5040) and compute
+//   coefficients
 //   - compute x^2, x^3, x^5, x^7 via hivm::VMul
 //   - scale each term with corresponding coefficient (-1/6, 1/120, -1/5040)
 //   - accumulate terms using hivm::VAdd
 //   - store the final result into destination vector
-//   - all intermediate results are lowered to vector operations on memref subviews
+//   - all intermediate results are lowered to vector operations on memref
+//   subviews
 void CodeGenTileLangNPUIRAPI::VsinCodegen(const CallNode *op) {
   tvm::tl::NpuirVSin npuirop(op->args, this->vmap);
   auto loc = builder.getUnknownLoc();
 
   llvm::SmallVector<Value> srcs;
   size_t n_srcs = npuirop.srcs.size();
-  for (size_t i=0; i < n_srcs; i++) {
+  for (size_t i = 0; i < n_srcs; i++) {
     Value src = GenSubviewFromRegion(npuirop.srcs[i], npuirop.srcs_range[i]);
     srcs.push_back(src);
   }
@@ -2100,39 +2352,61 @@ void CodeGenTileLangNPUIRAPI::VsinCodegen(const CallNode *op) {
 
   auto srcType = srcs_vr[0].getType().cast<MemRefType>();
   mlir::Type elementType = srcType.getElementType();
-  Value one = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, 1.0f));
-  Value minusOne = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, -1.0f));
-  Value six = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, 6.0f));
-  Value oneTwenty = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, 120.0f));
-  Value fiveThousandForty = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, 5040.0f));
+  Value one = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, 1.0f));
+  Value minusOne = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, -1.0f));
+  Value six = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, 6.0f));
+  Value oneTwenty = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, 120.0f));
+  Value fiveThousandForty = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, 5040.0f));
   Value minusOneOver6 = builder.create<mlir::arith::DivFOp>(loc, minusOne, six);
   Value oneOver120 = builder.create<mlir::arith::DivFOp>(loc, one, oneTwenty);
-  Value minusOneOver5040 = builder.create<mlir::arith::DivFOp>(loc, minusOne, fiveThousandForty);
+  Value minusOneOver5040 =
+      builder.create<mlir::arith::DivFOp>(loc, minusOne, fiveThousandForty);
 
   for (size_t i = 0; i < n_srcs; i++) {
     Value src = srcs[i];
-    Value x2 = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
-    Value x3 = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
-    Value x5 = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
-    Value x7 = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);    
-    Value tmp = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
+    Value x2 = mlir::utils::createTmpBufferOrTensorWithTargetType(
+        builder, loc, src, elementType);
+    Value x3 = mlir::utils::createTmpBufferOrTensorWithTargetType(
+        builder, loc, src, elementType);
+    Value x5 = mlir::utils::createTmpBufferOrTensorWithTargetType(
+        builder, loc, src, elementType);
+    Value x7 = mlir::utils::createTmpBufferOrTensorWithTargetType(
+        builder, loc, src, elementType);
+    Value tmp = mlir::utils::createTmpBufferOrTensorWithTargetType(
+        builder, loc, src, elementType);
 
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{src, src}, ValueRange{x2});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x2, src}, ValueRange{x3});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x3, x2}, ValueRange{x5});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x5, x2}, ValueRange{x7});
+    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{src, src},
+                                       ValueRange{x2});
+    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x2, src},
+                                       ValueRange{x3});
+    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x3, x2},
+                                       ValueRange{x5});
+    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x5, x2},
+                                       ValueRange{x7});
 
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x3, minusOneOver6}, ValueRange{x3});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x5, oneOver120}, ValueRange{x5});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x7, minusOneOver5040}, ValueRange{x7});
+    builder.create<mlir::hivm::VMulOp>(
+        loc, TypeRange{}, ValueRange{x3, minusOneOver6}, ValueRange{x3});
+    builder.create<mlir::hivm::VMulOp>(
+        loc, TypeRange{}, ValueRange{x5, oneOver120}, ValueRange{x5});
+    builder.create<mlir::hivm::VMulOp>(
+        loc, TypeRange{}, ValueRange{x7, minusOneOver5040}, ValueRange{x7});
 
-    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{src, x3}, ValueRange{tmp});
-    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x5, tmp}, ValueRange{tmp});
-    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x7, tmp}, ValueRange{dst});
+    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{src, x3},
+                                       ValueRange{tmp});
+    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x5, tmp},
+                                       ValueRange{tmp});
+    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x7, tmp},
+                                       ValueRange{dst});
   }
 }
 
-// Generate vector error function approximation using polynomial expansion in codegen.
+// Generate vector error function approximation using polynomial expansion in
+// codegen.
 //
 // before(TileLang/TIR semantic):
 //   Y = tl.npuir_verf
@@ -2140,20 +2414,22 @@ void CodeGenTileLangNPUIRAPI::VsinCodegen(const CallNode *op) {
 //     erf(x) ≈ (2/√π) * (x - x³/3 + x⁵/10 - x⁷/42)
 //
 // after(MLIR Lowering):
-//   - materialize scalar constants (2, √π, -1, 3, 1, 10, 42) and compute coefficients
+//   - materialize scalar constants (2, √π, -1, 3, 1, 10, 42) and compute
+//   coefficients
 //   - compute x^2, x^3, x^5, x^7 via hivm::VMul
 //   - scale each term with corresponding coefficient (-1/3, 1/10, -1/42)
 //   - accumulate terms using hivm::VAdd
 //   - multiply the result by (2/√π)
 //   - store the final result into destination vector
-//   - all intermediate results are lowered to vector operations on memref subviews
+//   - all intermediate results are lowered to vector operations on memref
+//   subviews
 void CodeGenTileLangNPUIRAPI::VerfCodegen(const CallNode *op) {
   tvm::tl::NpuirVErf npuirop(op->args, this->vmap);
   auto loc = builder.getUnknownLoc();
 
   llvm::SmallVector<Value> srcs;
   size_t n_srcs = npuirop.srcs.size();
-  for (size_t i=0; i < n_srcs; i++) {
+  for (size_t i = 0; i < n_srcs; i++) {
     Value src = GenSubviewFromRegion(npuirop.srcs[i], npuirop.srcs_range[i]);
     srcs.push_back(src);
   }
@@ -2162,43 +2438,69 @@ void CodeGenTileLangNPUIRAPI::VerfCodegen(const CallNode *op) {
 
   auto srcType = srcs_vr[0].getType().cast<MemRefType>();
   mlir::Type elementType = srcType.getElementType();
-  Value two = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, 2.0f));
-  Value sqrtPi = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, 1.7724538509055160f));
-  Value minusOne = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, -1.0f));
-  Value three = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, 3.0f));
-  Value one = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, 1.0f));
-  Value ten = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, 10.0f));
-  Value fortyTwo = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, 42.0f));
+  Value two = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, 2.0f));
+  Value sqrtPi = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, 1.7724538509055160f));
+  Value minusOne = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, -1.0f));
+  Value three = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, 3.0f));
+  Value one = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, 1.0f));
+  Value ten = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, 10.0f));
+  Value fortyTwo = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, 42.0f));
   Value twoOverSqrtPi = builder.create<mlir::arith::DivFOp>(loc, two, sqrtPi);
-  Value minusOneOver3 = builder.create<mlir::arith::DivFOp>(loc, minusOne, three);
+  Value minusOneOver3 =
+      builder.create<mlir::arith::DivFOp>(loc, minusOne, three);
   Value oneOver10 = builder.create<mlir::arith::DivFOp>(loc, one, ten);
-  Value minusOneOver42 = builder.create<mlir::arith::DivFOp>(loc, minusOne, fortyTwo);
+  Value minusOneOver42 =
+      builder.create<mlir::arith::DivFOp>(loc, minusOne, fortyTwo);
 
   for (size_t i = 0; i < n_srcs; i++) {
     Value src = srcs[i];
-    Value x2 = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
-    Value x3 = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
-    Value x5 = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
-    Value x7 = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);    
-    Value tmp = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
+    Value x2 = mlir::utils::createTmpBufferOrTensorWithTargetType(
+        builder, loc, src, elementType);
+    Value x3 = mlir::utils::createTmpBufferOrTensorWithTargetType(
+        builder, loc, src, elementType);
+    Value x5 = mlir::utils::createTmpBufferOrTensorWithTargetType(
+        builder, loc, src, elementType);
+    Value x7 = mlir::utils::createTmpBufferOrTensorWithTargetType(
+        builder, loc, src, elementType);
+    Value tmp = mlir::utils::createTmpBufferOrTensorWithTargetType(
+        builder, loc, src, elementType);
 
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{src, src}, ValueRange{x2});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x2, src}, ValueRange{x3});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x3, x2}, ValueRange{x5});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x5, x2}, ValueRange{x7});
+    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{src, src},
+                                       ValueRange{x2});
+    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x2, src},
+                                       ValueRange{x3});
+    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x3, x2},
+                                       ValueRange{x5});
+    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x5, x2},
+                                       ValueRange{x7});
 
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x3, minusOneOver3}, ValueRange{x3});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x5, oneOver10}, ValueRange{x5});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x7, minusOneOver42}, ValueRange{x7});
+    builder.create<mlir::hivm::VMulOp>(
+        loc, TypeRange{}, ValueRange{x3, minusOneOver3}, ValueRange{x3});
+    builder.create<mlir::hivm::VMulOp>(
+        loc, TypeRange{}, ValueRange{x5, oneOver10}, ValueRange{x5});
+    builder.create<mlir::hivm::VMulOp>(
+        loc, TypeRange{}, ValueRange{x7, minusOneOver42}, ValueRange{x7});
 
-    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{src, x3}, ValueRange{tmp});
-    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x5, tmp}, ValueRange{tmp});
-    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x7, tmp}, ValueRange{tmp});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{tmp, twoOverSqrtPi}, ValueRange{dst});
+    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{src, x3},
+                                       ValueRange{tmp});
+    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x5, tmp},
+                                       ValueRange{tmp});
+    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x7, tmp},
+                                       ValueRange{tmp});
+    builder.create<mlir::hivm::VMulOp>(
+        loc, TypeRange{}, ValueRange{tmp, twoOverSqrtPi}, ValueRange{dst});
   }
 }
 
-// Generate vector hyperbolic tangent approximation using polynomial expansion in codegen.
+// Generate vector hyperbolic tangent approximation using polynomial expansion
+// in codegen.
 //
 // before(TileLang/TIR semantic):
 //   Y = tl.npuir_vtanh
@@ -2206,19 +2508,21 @@ void CodeGenTileLangNPUIRAPI::VerfCodegen(const CallNode *op) {
 //     tanh(x) ≈ x - x³/3 + 2x⁵/15 - 17x⁷/315
 //
 // after(MLIR Lowering):
-//   - materialize scalar constants (2, -1, -17, 3, 15, 315) and compute coefficients
+//   - materialize scalar constants (2, -1, -17, 3, 15, 315) and compute
+//   coefficients
 //   - compute x^2, x^3, x^5, x^7 via hivm::VMul
 //   - scale each term with corresponding coefficient (-1/3, 2/15, -17/315)
 //   - accumulate terms using hivm::VAdd
 //   - store the final result into destination vector
-//   - all intermediate results are lowered to vector operations on memref subviews
+//   - all intermediate results are lowered to vector operations on memref
+//   subviews
 void CodeGenTileLangNPUIRAPI::VtanhCodegen(const CallNode *op) {
   tvm::tl::NpuirVTanh npuirop(op->args, this->vmap);
   auto loc = builder.getUnknownLoc();
 
   llvm::SmallVector<Value> srcs;
   size_t n_srcs = npuirop.srcs.size();
-  for (size_t i=0; i < n_srcs; i++) {
+  for (size_t i = 0; i < n_srcs; i++) {
     Value src = GenSubviewFromRegion(npuirop.srcs[i], npuirop.srcs_range[i]);
     srcs.push_back(src);
   }
@@ -2227,36 +2531,60 @@ void CodeGenTileLangNPUIRAPI::VtanhCodegen(const CallNode *op) {
 
   auto srcType = srcs_vr[0].getType().cast<MemRefType>();
   mlir::Type elementType = srcType.getElementType();
-  Value two = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, 2.0f));
-  Value minusOne = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, -1.0f));
-  Value minus17 = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, -17.0f));
-  Value three = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, 3.0f));
-  Value fifteen = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, 15.0f));
-  Value threeHundredFifteen = builder.create<mlir::arith::ConstantOp>(loc, builder.getFloatAttr(elementType, 315.0f));
-  Value minusOneOver3 = builder.create<mlir::arith::DivFOp>(loc, minusOne, three);
+  Value two = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, 2.0f));
+  Value minusOne = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, -1.0f));
+  Value minus17 = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, -17.0f));
+  Value three = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, 3.0f));
+  Value fifteen = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, 15.0f));
+  Value threeHundredFifteen = builder.create<mlir::arith::ConstantOp>(
+      loc, builder.getFloatAttr(elementType, 315.0f));
+  Value minusOneOver3 =
+      builder.create<mlir::arith::DivFOp>(loc, minusOne, three);
   Value twoOver15 = builder.create<mlir::arith::DivFOp>(loc, two, fifteen);
-  Value minusSeventeenOver315 = builder.create<mlir::arith::DivFOp>(loc, minus17, threeHundredFifteen);
+  Value minusSeventeenOver315 =
+      builder.create<mlir::arith::DivFOp>(loc, minus17, threeHundredFifteen);
 
   for (size_t i = 0; i < n_srcs; i++) {
     Value src = srcs[i];
-    Value x2 = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
-    Value x3 = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
-    Value x5 = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
-    Value x7 = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);    
-    Value tmp = mlir::utils::createTmpBufferOrTensorWithTargetType(builder, loc, src, elementType);
+    Value x2 = mlir::utils::createTmpBufferOrTensorWithTargetType(
+        builder, loc, src, elementType);
+    Value x3 = mlir::utils::createTmpBufferOrTensorWithTargetType(
+        builder, loc, src, elementType);
+    Value x5 = mlir::utils::createTmpBufferOrTensorWithTargetType(
+        builder, loc, src, elementType);
+    Value x7 = mlir::utils::createTmpBufferOrTensorWithTargetType(
+        builder, loc, src, elementType);
+    Value tmp = mlir::utils::createTmpBufferOrTensorWithTargetType(
+        builder, loc, src, elementType);
 
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{src, src}, ValueRange{x2});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x2, src}, ValueRange{x3});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x3, x2}, ValueRange{x5});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x5, x2}, ValueRange{x7});
+    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{src, src},
+                                       ValueRange{x2});
+    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x2, src},
+                                       ValueRange{x3});
+    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x3, x2},
+                                       ValueRange{x5});
+    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x5, x2},
+                                       ValueRange{x7});
 
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x3, minusOneOver3}, ValueRange{x3});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x5, twoOver15}, ValueRange{x5});
-    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{}, ValueRange{x7, minusSeventeenOver315}, ValueRange{x7});
+    builder.create<mlir::hivm::VMulOp>(
+        loc, TypeRange{}, ValueRange{x3, minusOneOver3}, ValueRange{x3});
+    builder.create<mlir::hivm::VMulOp>(
+        loc, TypeRange{}, ValueRange{x5, twoOver15}, ValueRange{x5});
+    builder.create<mlir::hivm::VMulOp>(loc, TypeRange{},
+                                       ValueRange{x7, minusSeventeenOver315},
+                                       ValueRange{x7});
 
-    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{src, x3}, ValueRange{tmp});
-    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x5, tmp}, ValueRange{tmp});
-    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x7, tmp}, ValueRange{dst});
+    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{src, x3},
+                                       ValueRange{tmp});
+    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x5, tmp},
+                                       ValueRange{tmp});
+    builder.create<mlir::hivm::VAddOp>(loc, TypeRange{}, ValueRange{x7, tmp},
+                                       ValueRange{dst});
   }
 }
 
@@ -2312,7 +2640,7 @@ mlir::Value CodeGenTileLangNPUIRAPI::VisitExpr_(const CallNode *op) {
     DotCodegen(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_bitcast"))) {
     BitcastCodegen(op);
-  }  else if (op->op.same_as(Op::Get("tl.npuir_div"))) {
+  } else if (op->op.same_as(Op::Get("tl.npuir_div"))) {
     CreateHIVMBinaryVectorOp<mlir::hivm::VDivOp>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_mul"))) {
     CreateHIVMBinaryVectorOp<mlir::hivm::VMulOp>(op);
@@ -2474,7 +2802,7 @@ void CodeGenTileLangNPUIRAPI::VisitStmt_(const AllocateNode *op) {
       {"shared.dyn", NPU_CORETYPE::AIC},
       {"wmma.accumulator", NPU_CORETYPE::AIC}};
   if (scope_coretype_map[scope] == this->current_coretype) {
-    std::vector<long int> shape = GetShape(op->extents);
+    std::vector<int64_t> shape = GetShape(op->extents);
     std::vector<int64_t> strides = GetStrideFromShapeAPI(op->extents);
 
     auto layoutMap =
@@ -2501,16 +2829,14 @@ mlir::Value CodeGenTileLangNPUIRAPI::VisitExpr_(const MinNode *op) {
   auto rhs = MakeValue(op->b);
   mlir::Value mlirVal;
   if (op->dtype.is_int()) {
-    mlirVal =
-        BinaryOpCodegen<mlir::arith::MinSIOp, std::nullptr_t>(
-            op, nullptr, lhs, rhs);
+    mlirVal = BinaryOpCodegen<mlir::arith::MinSIOp, std::nullptr_t>(op, nullptr,
+                                                                    lhs, rhs);
   } else if (op->dtype.is_uint()) {
-    mlirVal =
-        BinaryOpCodegen<mlir::arith::MinUIOp, std::nullptr_t>(
-            op, nullptr, lhs, rhs);
+    mlirVal = BinaryOpCodegen<mlir::arith::MinUIOp, std::nullptr_t>(op, nullptr,
+                                                                    lhs, rhs);
   } else if (op->dtype.is_float()) {
-    mlirVal = BinaryOpCodegen<mlir::arith::MinimumFOp,
-                              std::nullptr_t>(op, nullptr, lhs, rhs);
+    mlirVal = BinaryOpCodegen<mlir::arith::MinimumFOp, std::nullptr_t>(
+        op, nullptr, lhs, rhs);
   }
   return mlirVal;
 }
@@ -2520,16 +2846,14 @@ mlir::Value CodeGenTileLangNPUIRAPI::VisitExpr_(const MaxNode *op) {
   auto rhs = MakeValue(op->b);
   mlir::Value mlirVal;
   if (op->dtype.is_int()) {
-    mlirVal =
-        BinaryOpCodegen<mlir::arith::MaxSIOp, std::nullptr_t>(
-            op, nullptr, lhs, rhs);
+    mlirVal = BinaryOpCodegen<mlir::arith::MaxSIOp, std::nullptr_t>(op, nullptr,
+                                                                    lhs, rhs);
   } else if (op->dtype.is_uint()) {
-    mlirVal =
-        BinaryOpCodegen<mlir::arith::MaxUIOp, std::nullptr_t>(
-            op, nullptr, lhs, rhs);
+    mlirVal = BinaryOpCodegen<mlir::arith::MaxUIOp, std::nullptr_t>(op, nullptr,
+                                                                    lhs, rhs);
   } else if (op->dtype.is_float()) {
-    mlirVal = BinaryOpCodegen<mlir::arith::MaximumFOp,
-                              std::nullptr_t>(op, nullptr, lhs, rhs);
+    mlirVal = BinaryOpCodegen<mlir::arith::MaximumFOp, std::nullptr_t>(
+        op, nullptr, lhs, rhs);
   }
   return mlirVal;
 }
@@ -2539,13 +2863,11 @@ mlir::Value CodeGenTileLangNPUIRAPI::VisitExpr_(const AddNode *op) {
   auto rhs = MakeValue(op->b);
   mlir::Value mlirVal;
   if (op->dtype.is_int() || op->dtype.is_uint()) {
-    mlirVal =
-        BinaryOpCodegen<mlir::arith::AddIOp, std::nullptr_t>(
-            op, nullptr, lhs, rhs);
+    mlirVal = BinaryOpCodegen<mlir::arith::AddIOp, std::nullptr_t>(op, nullptr,
+                                                                   lhs, rhs);
   } else if (op->dtype.is_float()) {
-    mlirVal =
-        BinaryOpCodegen<mlir::arith::AddFOp, std::nullptr_t>(
-            op, nullptr, lhs, rhs);
+    mlirVal = BinaryOpCodegen<mlir::arith::AddFOp, std::nullptr_t>(op, nullptr,
+                                                                   lhs, rhs);
   }
   return mlirVal;
 }
@@ -2555,23 +2877,21 @@ mlir::Value CodeGenTileLangNPUIRAPI::VisitExpr_(const SubNode *op) {
   auto rhs = MakeValue(op->b);
   mlir::Value mlirVal;
   if (op->dtype.is_int() || op->dtype.is_uint()) {
-    mlirVal =
-        BinaryOpCodegen<mlir::arith::SubIOp, std::nullptr_t>(
-            op, nullptr, lhs, rhs);
+    mlirVal = BinaryOpCodegen<mlir::arith::SubIOp, std::nullptr_t>(op, nullptr,
+                                                                   lhs, rhs);
   } else if (op->dtype.is_float()) {
-    mlirVal =
-        BinaryOpCodegen<mlir::arith::SubFOp, std::nullptr_t>(
-            op, nullptr, lhs, rhs);
+    mlirVal = BinaryOpCodegen<mlir::arith::SubFOp, std::nullptr_t>(op, nullptr,
+                                                                   lhs, rhs);
   }
   return mlirVal;
 }
 
-mlir::Value
-CodeGenTileLangNPUIRAPI::VisitExpr_(const FloatImmNode *op) {
+mlir::Value CodeGenTileLangNPUIRAPI::VisitExpr_(const FloatImmNode *op) {
   // check if same node already created
-  // If already created return corresponding MLIR value and do not create duplicated MLIR Op
+  // If already created return corresponding MLIR value and do not create
+  // duplicated MLIR Op
   std::pair<bool, mlir::Value> result = CheckPrimExprMap(op);
-  if (result.first){
+  if (result.first) {
     return result.second;
   }
   auto type = DTypetoMLIRType(op->dtype);
@@ -2583,15 +2903,15 @@ CodeGenTileLangNPUIRAPI::VisitExpr_(const FloatImmNode *op) {
 
 mlir::Value CodeGenTileLangNPUIRAPI::VisitExpr_(const IntImmNode *op) {
   // check if same node already created
-  // If already created return corresponding MLIR value and do not create duplicated MLIR Op
+  // If already created return corresponding MLIR value and do not create
+  // duplicated MLIR Op
   std::pair<bool, mlir::Value> result = CheckPrimExprMap(op);
-  if (result.first){
+  if (result.first) {
     return result.second;
   }
   auto type = DTypetoMLIRType(op->dtype);
   auto IntConst = builder.create<mlir::arith::ConstantOp>(
-      mlir::UnknownLoc::get(&context),
-      builder.getIntegerAttr(type, op->value));
+      mlir::UnknownLoc::get(&context), builder.getIntegerAttr(type, op->value));
   UpdatePrimExprMap(op, IntConst);
   return IntConst;
 }
@@ -2601,13 +2921,11 @@ mlir::Value CodeGenTileLangNPUIRAPI::VisitExpr_(const MulNode *op) {
   auto rhs = MakeValue(op->b);
   mlir::Value mlirVal;
   if (op->dtype.is_int() || op->dtype.is_uint()) {
-    mlirVal =
-        BinaryOpCodegen<mlir::arith::MulIOp, std::nullptr_t>(
-            op, nullptr, lhs, rhs);
+    mlirVal = BinaryOpCodegen<mlir::arith::MulIOp, std::nullptr_t>(op, nullptr,
+                                                                   lhs, rhs);
   } else if (op->dtype.is_float()) {
-    mlirVal =
-        BinaryOpCodegen<mlir::arith::MulFOp, std::nullptr_t>(
-            op, nullptr, lhs, rhs);
+    mlirVal = BinaryOpCodegen<mlir::arith::MulFOp, std::nullptr_t>(op, nullptr,
+                                                                   lhs, rhs);
   }
   return mlirVal;
 }
@@ -2617,9 +2935,8 @@ mlir::Value CodeGenTileLangNPUIRAPI::VisitExpr_(const AndNode *op) {
   CHECK(op->b.dtype().is_int() || op->b.dtype().is_uint());
   auto lhs = MakeValue(op->a);
   auto rhs = MakeValue(op->b);
-  auto mlirVal =
-      BinaryOpCodegen<mlir::arith::AndIOp, std::nullptr_t>(
-          op, nullptr, lhs, rhs);
+  auto mlirVal = BinaryOpCodegen<mlir::arith::AndIOp, std::nullptr_t>(
+      op, nullptr, lhs, rhs);
   return mlirVal;
 }
 
@@ -2628,18 +2945,16 @@ mlir::Value CodeGenTileLangNPUIRAPI::VisitExpr_(const OrNode *op) {
   CHECK(op->b.dtype().is_int() || op->b.dtype().is_uint());
   auto lhs = MakeValue(op->a);
   auto rhs = MakeValue(op->b);
-  auto mlirVal =
-      BinaryOpCodegen<mlir::arith::OrIOp, std::nullptr_t>(
-          op, nullptr, lhs, rhs);
+  auto mlirVal = BinaryOpCodegen<mlir::arith::OrIOp, std::nullptr_t>(
+      op, nullptr, lhs, rhs);
   return mlirVal;
 }
 
 mlir::Value CodeGenTileLangNPUIRAPI::VisitExpr_(const DivNode *op) {
   auto lhs = MakeValue(op->a);
   auto rhs = MakeValue(op->b);
-  auto mlirVal =
-      BinaryOpCodegen<mlir::arith::DivFOp, std::nullptr_t>(
-          op, nullptr, lhs, rhs);
+  auto mlirVal = BinaryOpCodegen<mlir::arith::DivFOp, std::nullptr_t>(
+      op, nullptr, lhs, rhs);
   return mlirVal;
 }
 
@@ -2652,7 +2967,7 @@ mlir::Value CodeGenTileLangNPUIRAPI::VisitExpr_(const SelectNode *op) {
       builder.getUnknownLoc(), condition, true_value, false_value);
 }
 
-String CodeGenTileLangNPUIRAPI::GetCurrentFunctionName(){
+String CodeGenTileLangNPUIRAPI::GetCurrentFunctionName() {
   return this->current_function_name;
 }
 
@@ -2666,7 +2981,8 @@ void CodeGenTileLangNPUIRAPI::AddFunctionForCoreType(const GlobalVar &gvar,
       << "CodeGenC: Expect PrimFunc to have the global_symbol attribute";
   this->current_function_name = static_cast<std::string>(global_symbol.value());
   if (this->func_coretype == NPU_CORETYPE::MIX) {
-    this->current_function_name = this->current_function_name + "_mix_" + NPU_CORETYPE_STR[this->current_coretype];
+    this->current_function_name = this->current_function_name + "_mix_" +
+                                  NPU_CORETYPE_STR[this->current_coretype];
   }
 
   // Create function type
@@ -2705,8 +3021,8 @@ void CodeGenTileLangNPUIRAPI::AddFunctionForCoreType(const GlobalVar &gvar,
 
   // Create function signature
   builder.setInsertionPointToEnd(module->getBody());
-  auto funcOp = builder.create<func::FuncOp>(builder.getUnknownLoc(),
-                                              this->current_function_name, funcType);
+  auto funcOp = builder.create<func::FuncOp>(
+      builder.getUnknownLoc(), this->current_function_name, funcType);
   mlir::Block *entryBlock = funcOp.addEntryBlock();
   builder.setInsertionPointToStart(entryBlock);
   for (int i = 0; i < f->params.size(); ++i) {
@@ -2715,35 +3031,33 @@ void CodeGenTileLangNPUIRAPI::AddFunctionForCoreType(const GlobalVar &gvar,
     var_map_[real_v.get()] = funcOp.getArgument(i + funcArgsOffset);
   }
   builder.create<hivm::SetFFTSBaseAddrOp>(builder.getUnknownLoc(),
-                                           funcOp.getArgument(0));
+                                          funcOp.getArgument(0));
   for (auto recastInfo : recastNeedInsert) {
     tir::Var v = f->params[recastInfo.first];
     tir::Var real_v = f->buffer_map[v]->data;
     Array<PrimExpr> shape = f->buffer_map[v]->shape;
+    Array<PrimExpr> strides = f->buffer_map[v]->strides;
+    llvm::SmallVector<PrimExpr> shapeExprs(shape.begin(), shape.end());
     auto memrefType = llvm::dyn_cast<MemRefType>(recastInfo.second);
     auto strideLayout =
         llvm::dyn_cast<StridedLayoutAttr>(memrefType.getLayout());
-    SmallVector<OpFoldResult> shape_val;
-    for (PrimExpr s : shape) {
-      if (auto s_int = as_const_int(s)) {
-        shape_val.push_back(builder.getI64IntegerAttr(*s_int));
-      } else {
-        mlir::Value s_index = CreateIndexCastOp(MakeValue(s));
-        shape_val.push_back(s_index);
-      }
-    }
-    size_t dim = shape.size();
-    SmallVector<OpFoldResult> stride_val(dim);
-    tvm::PrimExpr tmp_stride = IntImm(shape[0].dtype(), 1);
-    for (int i = dim - 1; i >= 0; i--) {
-      mlir::Value s_index = CreateIndexCastOp(MakeValue(tmp_stride));
-      stride_val[i] = s_index;
-      tmp_stride = Mul(shape[i], tmp_stride);
-    }
+    SmallVector<OpFoldResult> shape_val = BuildIndexFoldResultsFromExprs(
+        builder, shapeExprs, [this](PrimExpr expr) {
+          mlir::Value value = MakeValue(expr);
+          return value.getType().isIndex() ? value : CreateIndexCastOp(value);
+        });
+    SmallVector<PrimExpr> strideExprs =
+        strides.empty() ? BuildContiguousStrideExprs(shapeExprs)
+                        : SmallVector<PrimExpr>(strides.begin(), strides.end());
+    SmallVector<OpFoldResult> stride_val = BuildIndexFoldResultsFromExprs(
+        builder, strideExprs, [this](PrimExpr expr) {
+          mlir::Value value = MakeValue(expr);
+          return value.getType().isIndex() ? value : CreateIndexCastOp(value);
+        });
     OpFoldResult offset = builder.getI64IntegerAttr(strideLayout.getOffset());
     auto recastOp = builder.create<memref::ReinterpretCastOp>(
-        builder.getUnknownLoc(), memrefType, var_map_[real_v.get()],
-        offset, shape_val, stride_val);
+        builder.getUnknownLoc(), memrefType, var_map_[real_v.get()], offset,
+        shape_val, stride_val);
     var_map_[real_v.get()] = recastOp;
   }
   mlir::hacc::KernelArgTypeAttr accArgAttr = hacc::KernelArgTypeAttr::get(
@@ -2762,8 +3076,8 @@ void CodeGenTileLangNPUIRAPI::AddFunctionForCoreType(const GlobalVar &gvar,
   funcOp->setAttr(hivm::TFuncCoreTypeAttr::name, funcCoreTypeAttr);
   if (this->func_coretype == NPU_CORETYPE::MIX) {
     funcOp->setAttr(hivm::TPartOfMixAttr::name, builder.getUnitAttr());
-    funcOp->setAttr("mix_mode", builder.getStringAttr(
-                                    NPU_CORETYPE_STR[NPU_CORETYPE::MIX]));
+    funcOp->setAttr("mix_mode",
+                    builder.getStringAttr(NPU_CORETYPE_STR[NPU_CORETYPE::MIX]));
   } else {
     funcOp->setAttr("mix_mode", builder.getStringAttr(
                                     NPU_CORETYPE_STR[this->current_coretype]));
@@ -2784,8 +3098,8 @@ void CodeGenTileLangNPUIRAPI::InitFuncState() {
   this->current_function_name = "";
 }
 
-void CodeGenTileLangNPUIRAPI::AddFunction(const GlobalVar& gvar, const PrimFunc& f)
-{
+void CodeGenTileLangNPUIRAPI::AddFunction(const GlobalVar &gvar,
+                                          const PrimFunc &f) {
   InferFuncCoreType infer;
   infer.VisitStmt(f->body);
 
@@ -2834,33 +3148,31 @@ mlir::Value CodeGenTileLangNPUIRAPI::VisitExpr_(const ModNode *op) {
   auto rhs = MakeValue(op->b);
   mlir::Value mlirVal;
   if (op->dtype.is_int() || op->dtype.is_uint()) {
-    mlirVal =
-        BinaryOpCodegen<mlir::arith::RemSIOp, std::nullptr_t>(
-            op, nullptr, lhs, rhs);
+    mlirVal = BinaryOpCodegen<mlir::arith::RemSIOp, std::nullptr_t>(op, nullptr,
+                                                                    lhs, rhs);
   } else if (op->dtype.is_float()) {
-    mlirVal =
-        BinaryOpCodegen<mlir::arith::RemFOp, std::nullptr_t>(
-            op, nullptr, lhs, rhs);
+    mlirVal = BinaryOpCodegen<mlir::arith::RemFOp, std::nullptr_t>(op, nullptr,
+                                                                   lhs, rhs);
   }
   return mlirVal;
 }
 
 mlir::Value CodeGenTileLangNPUIRAPI::VisitExpr_(const NotNode *op) {
   // check if same node already created
-  // If already created return corresponding MLIR value and do not create duplicated MLIR Op
+  // If already created return corresponding MLIR value and do not create
+  // duplicated MLIR Op
   std::pair<bool, mlir::Value> result = CheckPrimExprMap(op);
-  if (result.first){
+  if (result.first) {
     return result.second;
   }
   // Not operator does not exist in arith
   // Need to use XOR for Not
   auto trueValue = builder.create<mlir::arith::ConstantOp>(
-      builder.getUnknownLoc(), builder.getI1Type(),
-      builder.getBoolAttr(true));
+      builder.getUnknownLoc(), builder.getI1Type(), builder.getBoolAttr(true));
   auto inputValue = MakeValue(op->a);
   auto xorOperation = builder.create<mlir::arith::XOrIOp>(
       builder.getUnknownLoc(), inputValue, trueValue.getResult());
- UpdatePrimExprMap(op, xorOperation);
+  UpdatePrimExprMap(op, xorOperation);
   return xorOperation;
 }
 
@@ -2898,7 +3210,7 @@ mlir::Value CodeGenTileLangNPUIRAPI::VisitExpr_(const BufferLoadNode *op) {
 
   // Create memef.load op in MLIR
   return builder.create<mlir::memref::LoadOp>(builder.getUnknownLoc(), mem,
-                                               convert_inds);
+                                              convert_inds);
 }
 
 mlir::Value CodeGenTileLangNPUIRAPI::VisitExpr_(const RampNode *op) {
@@ -2939,7 +3251,7 @@ void CodeGenTileLangNPUIRAPI::VisitStmt_(const BufferStoreNode *op) {
   }
 
   builder.create<mlir::memref::StoreOp>(builder.getUnknownLoc(), mlir_value,
-                                         mem, convert_inds);
+                                        mem, convert_inds);
 }
 
 void CodeGenTileLangNPUIRAPI::VisitStmt_(const WhileNode *op) {

@@ -2,11 +2,11 @@ name: AscendNPU-IR CI
 
 on:
   pull_request:
-    branches: [npuir]
+    branches: [main]
   issue_comment:
     types: [created]
   release:
-    types: [published]
+    types: [published,prereleased]
 
 permissions:
   contents: read
@@ -17,7 +17,7 @@ jobs:
       github.event_name == 'pull_request' ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request &&
-       contains(github.event.comment.body, 'BuildTilelang'))
+       contains(github.event.comment.body, 'TilelangFullTest'))
     runs-on: ubuntu-22.04
     outputs:
       pr-number: ${{ steps.pr-info.outputs.number }}
@@ -46,9 +46,9 @@ jobs:
           core.setOutput('checkout_ref', `refs/pull/${pr.number}/merge`);
 
     - name: Validate target branch
-      if: steps.pr-info.outputs.target_branch != 'npuir'
+      if: steps.pr-info.outputs.target_branch != 'main'
       run: |
-        echo "::error::PR target branch is '${{ steps.pr-info.outputs.target_branch }}', expected 'npuir'. Skipping."
+        echo "::error::PR target branch is '${{ steps.pr-info.outputs.target_branch }}', expected 'main'. Skipping."
         exit 1
 
   build:
@@ -77,31 +77,100 @@ jobs:
         name: tilelang-npuir-py3.11-arm64
         path: dist/
 
-    - name: Install clang
-      run: |
-        apt-get update && apt-get install -y clang
-
     - name: Install tilelang and test dependencies
       env:
         TORCH_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu"
         PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
       run: |
         CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
+        sed -Ei "s@(ports|archive).ubuntu.com@${CACHING_URL}:8081@g" /etc/apt/sources.list
         pip config set global.index-url http://${CACHING_URL}/pypi/simple
         pip config set global.trusted-host "${CACHING_URL}"
-        pip install torch==2.7.1+cpu -i ${TORCH_CACHE_URL} --extra-index-url ${PYPI_CACHE_URL}
+        pip install torch==2.7.1 -i ${TORCH_CACHE_URL} --extra-index-url ${PYPI_CACHE_URL}
         pip install torch-npu==2.7.1
         pip install dist/*.whl
         pip install pytest pytest-xdist pytest-html numpy
+
+    - name: Install clang
+      run: |
+        apt-get update && apt-get install -y clang
+
+    - name: Prepare npuir test workspace
+      run: |
+        mkdir -p testing/npuir/output
+        if [ -d tilelang ] && [ ! -d _tilelang_src ]; then
+          mv tilelang _tilelang_src
+        fi
+
+    - name: Run npuir examples (python scripts)
+      env:
+        TILELANG_CLEAR_CACHE: "1"
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p testing/npuir/output/examples
+
+        EXAMPLE_FILES=(
+          examples/deepseek_v32/sparse_mla_bwd.py
+          examples/deepseek_v32/sparse_mla_fwd.py
+          examples/elementwise/atomic_add_dev.py
+          examples/elementwise/atomic_add.py
+          examples/elementwise/example_elementwise_add.py
+          examples/elementwise/vec_add_1d.py
+          examples/elementwise/vec_add_2d_dynamic_shape.py
+          examples/elementwise/vec_add_2d.py
+          examples/elementwise/vec_add_auto_brc.py
+          examples/gemm/example_gemm.py
+          examples/gemm/example_gemm_int82int32.py
+          examples/gemm/matmul_dynamic_shape.py
+          examples/gemm/matmul.py
+          examples/gemv/example_gemv.py
+          examples/mixcv/example_mixcv.py
+          examples/norm/example_rms_norm.py
+          examples/exp2.py
+          examples/log2.py
+          examples/flash_attn_npuir.py
+          examples/mixcv_mixkernel.py
+          examples/flash_attn_npuir_dev.py
+          examples/sparse_mla_fwd.py
+          examples/vectorization_in_parallel.py
+          examples/engram/engram_bwd_exp.py
+          examples/engram/engram_bwd.py
+          examples/engram/engram_decode.py
+          examples/engram/engram_fwd.py
+          examples/sparse_mla_fwd_dynamic_shape.py
+          examples/deepseek_v4/engram/engram_gate_kernel_bwd.py
+          examples/deepseek_v4/engram/engram_gate_kernel_fwd.py
+          examples/deepseek_v4/example_act_quant_kernel.py
+          examples/deepseek_v4/example_hc_split_sinkhorn_kernel.py
+          examples/deepseek_v4/example_mhc_post.py
+          examples/deepseek_v4/example_sparse_attn_kernel_highperf.py
+          examples/deepseek_v4/example_sparse_attn_kernel.py
+          examples/deepseek_v4/example_sparse_attn_bwd_kernel.py
+          examples/norm/layer_norm.py
+        )
+
+        for script in "${EXAMPLE_FILES[@]}"; do
+          if [[ ! -f "${script}" ]]; then
+            echo "::error::Example file not found: ${script}"
+            exit 1
+          fi
+
+          log_file="testing/npuir/output/examples/$(basename "${script}").log"
+          echo "Running: python ${script}"
+          python "${script}" 2>&1 | tee "${log_file}"
+
+          if ! grep -Eqi "passed|success" "${log_file}"; then
+            echo "::error::${script} did not print a success marker. Expected 'passed' or 'success' in output."
+            exit 1
+          fi
+        done
 
     - name: Run npuir tests
       env:
         TILELANG_CLEAR_CACHE: "1"
       run: |
-        mkdir -p testing/npuir/output
-        mv tilelang _tilelang_src
-        python -m pytest -v testing/npuir/*_ops \
-          -n 2 \
+        python -m pytest -v testing/npuir/*_ops -n 2\
           --html=testing/npuir/output/report.html --self-contained-html \
           --junitxml=testing/npuir/output/junit.xml
 
@@ -113,14 +182,14 @@ jobs:
         path: testing/npuir/output/
 
   build-release:
-    if: github.event_name == 'release' && github.event.action == 'published'
+    if: github.event_name == 'release'
     uses: ./.github/workflows/build-tilelang-npuir.yml
     with:
       checkout-ref: refs/tags/${{ github.event.release.tag_name }}
     secrets: inherit
 
   upload-release-assets:
-    if: github.event_name == 'release' && github.event.action == 'published'
+    if: github.event_name == 'release'
     needs: build-release
     runs-on: ubuntu-22.04
     permissions:

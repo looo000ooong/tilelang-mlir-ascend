@@ -6,38 +6,31 @@ from typing import List, Union, Literal, Optional
 from pathlib import Path
 from tvm.target import Target
 from tvm.tir import PrimFunc
-from tilelang.jit import JITKernel
+
 from .kernel_cache import KernelCache
-from .tuner_cache import AutoTunerCache
-from tilelang.env import TILELANG_CLEAR_CACHE
+from tilelang import env
 
-# Create singleton instance of KernelCache
-# _kernel_cache_instance = KernelCache()
-_kernel_cache_instance = AutoTunerCache()
+# Singleton instance of KernelCache
+_kernel_cache_instance = KernelCache()
 
-def cached(
+
+def cached_npu(
     func: PrimFunc = None,
     out_idx: List[int] = None,
-    workspace_idx: List[int] = None,
-    *args,
-    target: Union[str, Target] = "auto",
+    target: Union[str, Target] = "npuir",
     target_host: Union[str, Target] = None,
-    platform: Literal["A2", "A3", "A5"] = "A3",
-    execution_backend: Optional[Literal["dlpack", "ctypes", "cython"]] = "cython",
-    verbose: Optional[bool] = False,
+    execution_backend: Optional[Literal["cython"]] = "cython",
+    verbose: Optional[bool] = True,
     pass_configs: Optional[dict] = None,
-) -> JITKernel:
+):
     """
-    Caches and reuses compiled kerne(ls (using KernelCache class).
+    Caches and reuses compiled NPU kernels (using KernelCache class).
     """
-    return _kernel_cache_instance.cached(
+    return _kernel_cache_instance.cached_npu(
         func,
         out_idx,
-        # workspace_idx,
-        *args,
         target=target,
         target_host=target_host,
-        # platform=platform,
         execution_backend=execution_backend,
         verbose=verbose,
         pass_configs=pass_configs,
@@ -70,5 +63,5 @@ def clear_cache():
     _kernel_cache_instance.clear_cache()
 
 
-if TILELANG_CLEAR_CACHE.lower() in ("1", "true", "yes", "on"):
+if env.TILELANG_CLEAR_CACHE.lower() in ("1", "true", "yes", "on"):
     clear_cache()

@@ -37,23 +37,28 @@ T.ceildiv(lhs, rhs)
 
 一般在分核的核数计算及定义坐标时使用
 
-```
+```python
+@tilelang.jit(target="npuir")
 def vec_add(block_M, block_N, dtype="float32"):
     M = T.symbolic("M")
     N = T.symbolic("N")
 
     @T.prim_func
     def main(
-            A: T.Tensor((M, N), dtype),
-            B: T.Tensor((M, N), dtype),
-            C: T.Tensor((M, N), dtype)
+        A: T.Tensor((M, N), dtype),
+        B: T.Tensor((M, N), dtype),
+        C: T.Tensor((M, N), dtype),
     ):
-        with T.Kernel(T.ceildiv(N, block_N) * T.ceildiv(M, block_M), is_npu=True) as (cid, _):
-            #代码段省略
+        with T.Kernel(T.ceildiv(N, block_N) * T.ceildiv(M, block_M), is_npu=True) as (
+            cid,
+            _,
+        ):
+            # 代码段省略
+            pass
 
     return main
 ```
 
 ## 3. Tilelang Op到Ascend NPU IR Op的转换
 
-`tilelang::ceildiv` Op 将被下降为 `arith.addi` Op, `arith.divsi` Op
+`tilelang::ceildiv` Op 将被转换为 `arith.addi` Op, `arith.divsi` Op

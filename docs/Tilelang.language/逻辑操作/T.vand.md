@@ -22,7 +22,7 @@ T.vand(A, B, C)
 
 |              | int8 | int16 | int32 | uint8 | uint16 | uint32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | bool |
 | :----------- | :--: | :---: | :---: | :---: | :----: | :----: | :----: | :---: | :--: | :--: | :--: | :--: | :--: |
-| Ascend A2/A3 |   ×   |   √   |    ×  |    ×   |   ×    |   ×    |   ×    |   √   |  ×   |  ×   |  ×   |  ×   |  √   |
+| Ascend A2/A3 |   ×   |   √   |    ×  |    ×   |   ×    |   ×    |   ×    |   √   |  √   |  √   |  ×   |  ×   |  √   |
 
 ### 2.3 Shape支持
 
@@ -38,17 +38,17 @@ def vec_and(block_M, block_N, dtype="float16"):
 
     @T.prim_func
     def main(
-            A: T.Tensor((block_M, block_N), dtype),
-			B: T.Tensor((block_M, block_N), dtype),
-            C: T.Tensor((block_M, block_N), dtype),
+        A: T.Tensor((block_M, block_N), dtype),
+        B: T.Tensor((block_M, block_N), dtype),
+        C: T.Tensor((block_M, block_N), dtype),
     ):
         with T.Kernel(BLOCK_SIZE, is_npu=True) as (cid, _):
             A_VEC = T.alloc_ub((block_M, block_N), dtype)
-	        B_VEC = T.alloc_ub((block_M, block_N), dtype)
+            B_VEC = T.alloc_ub((block_M, block_N), dtype)
             C_VEC = T.alloc_ub((block_M, block_N), dtype)
 
             T.copy(A, A_VEC)
-	        T.copy(B, B_VEC)
+            T.copy(B, B_VEC)
             T.vand(A_VEC, B_VEC, C_VEC)
             T.copy(C_VEC, C)
 
@@ -57,4 +57,4 @@ def vec_and(block_M, block_N, dtype="float16"):
 
 ## 3. Tilelang Op到Ascend NPU IR Op的转换
 
-`tilelang::vandOp`将被下降为 `hivm.hir.VAndOp`
+`tilelang::vandOp`将被转换为 `hivm.hir.VAndOp`

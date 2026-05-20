@@ -17,7 +17,7 @@ DTYPES = ["float16"]
 
 
 @tilelang.jit(target="npuir")
-def slice_reduce(block_M, block_N, dtype="float16"):
+def slice_reduce_dev(block_M, block_N, dtype="float16"):
     M = T.symbolic("M")
     N = T.symbolic("N")
     BLOCK_SIZE = 1
@@ -39,11 +39,18 @@ def slice_reduce(block_M, block_N, dtype="float16"):
                     offset_m = j * block_M
                     remain_m = T.min(block_M, M - offset_m)
                     T.copy(
-                        Input[offset_m : offset_m + remain_m, offset_n : offset_n + remain_n],
-                        src,
+                        Input[
+                            offset_m : offset_m + remain_m,
+                            offset_n : offset_n + remain_n,
+                        ],
+                        src[0:remain_m, 0:remain_n],
                     )
                     T.npuir_reduce(
-                        src[:remain_m, :], dst, dims=0, reduce_mode="abssum", clear=False
+                        src[:remain_m, :],
+                        dst,
+                        dims=0,
+                        reduce_mode="abssum",
+                        clear=False,
                     )
                 T.copy(
                     dst[0, :remain_n],
@@ -54,8 +61,8 @@ def slice_reduce(block_M, block_N, dtype="float16"):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_slice_reduce_case1(dtype):
-    kernel = slice_reduce(32, 32)
+def test_slice_reduce_dev_case1(dtype):
+    kernel = slice_reduce_dev(32, 32)
     torch.manual_seed(42)
     M, N = 17, 256
     input_t = gen_tensor((M, N), dtype, kind="randn")
@@ -66,8 +73,8 @@ def test_slice_reduce_case1(dtype):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_slice_reduce_case2(dtype):
-    kernel = slice_reduce(32, 32)
+def test_slice_reduce_dev_case2(dtype):
+    kernel = slice_reduce_dev(32, 32)
     torch.manual_seed(42)
     M, N = 39, 466
     input_t = gen_tensor((M, N), dtype, kind="randn")
@@ -78,8 +85,8 @@ def test_slice_reduce_case2(dtype):
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
-def test_slice_reduce_case3(dtype):
-    kernel = slice_reduce(32, 32)
+def test_slice_reduce_dev_case3(dtype):
+    kernel = slice_reduce_dev(32, 32)
     torch.manual_seed(42)
     M, N = 77, 283
     input_t = gen_tensor((M, N), dtype, kind="randn")
