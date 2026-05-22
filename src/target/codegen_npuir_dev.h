@@ -279,6 +279,7 @@ private:
   template <typename T, typename U> void UnaryVecOpCodegen(const CallNode *op);
   void BarrierCodegen(const CallNode *op);
   void VselectCodegen(const CallNode *op);
+  void VselectCodegenA5(const CallNode *op);
   template <typename T, typename U>
   mlir::Value BinaryOpCodegen(const PrimExprNode *op, U mode, mlir::Value lhs, mlir::Value rhs);
   // Scalar ops codegen
