@@ -2637,7 +2637,7 @@ void CodeGenTileLangNPUIRDEV::VcumsumCodegen(const CallNode *op) {
     return;
   }
   auto booleanAttr = mlir::BoolAttr::get(builder.getContext(), false);
-  auto newCumsumOp = builder.create<mlir::hivm::VCumsumOp>(
+  auto newCumsumOp = builder.create<mlir::hfusion::CumsumOp>(
       loc, result_tensors, src, dst,
       builder.getDenseI64ArrayAttr(npuirop.cum_dims), booleanAttr);
   SetVarValue(npuirop.dst, newCumsumOp->getResult(0));
@@ -2882,30 +2882,21 @@ void CodeGenTileLangNPUIRDEV::VinterleaveCodegen(const CallNode *op) {
     srcs.push_back(src);
   }
   mlir::ValueRange srcs_vr(srcs);
-  Value dst = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
-  builder.create<mlir::hivm::VInterleaveOp>(
-      builder.getUnknownLoc(), TypeRange{}, srcs_vr, dst,
-      static_cast<int64_t>(npuirop.channel_nums));
-}
+  mlir::Value dst_tensor = GenExtractSliceFromRegion(npuirop.dst, npuirop.dst_range);
 
-void CodeGenTileLangNPUIRDEV::VdeinterleaveCodegen(const CallNode *op) {
-  tvm::tl::NpuirDeinterleave npuirop(op->args, this->vmap);
-  Value src = GenSubviewFromRegion(npuirop.src, npuirop.src_range);
-  llvm::SmallVector<Value> dsts;
-  size_t n_dsts = npuirop.dsts.size();
-  for (size_t i = 0; i < n_dsts; i++) {
-    Value dst = GenSubviewFromRegion(npuirop.dsts[i], npuirop.dsts_range[i]);
-    dsts.push_back(dst);
-  }
-  mlir::ValueRange dsts_vr(dsts);
-  auto channel_nums = mlir::IntegerAttr::get(
-      builder.getI64Type(), static_cast<int64_t>(npuirop.channel_nums));
-  mlir::hivm::DeinterleaveModeAttr index_mode =
-      mlir::hivm::DeinterleaveModeAttr::get(
-          &context, NPUIR_STR_DEINTERLEAVEMODE[npuirop.index_mode]);
-  builder.create<mlir::hivm::VDeinterleaveOp>(builder.getUnknownLoc(),
-                                              TypeRange{}, src, dsts_vr,
-                                              channel_nums, index_mode);
+  auto interleaveOp = builder.create<mlir::hfusion::InterleaveOp>(
+    builder.getUnknownLoc(),
+    dst_tensor.getType(),
+    srcs_vr
+  );
+
+  mlir::Value result = ReshapeCastAndInsertSlice(
+    interleaveOp->getResult(0),
+    GetVarValue(npuirop.dst),
+    npuirop.dst_range
+  );
+
+  SetVarValue(npuirop.dst, result);
 }
 
 /// Generate hivm.hir.varange for tl.npuir_arange.
@@ -3809,7 +3800,7 @@ mlir::Value CodeGenTileLangNPUIRDEV::VisitExpr_(const CallNode *op) {
     UnaryVecOpCodegen<tvm::tl::NpuirSqrt, ElemwiseOp<linalg::UnaryFn::sqrt>>(
         op);
   } else if (op->op.same_as(Op::Get("tl.npuir_rsqrt"))) {
-    UnaryVecOpCodegen<tvm::tl::NpuirRsqrt, ElemwiseOp<linalg::UnaryFn::rsqrt>>(
+    UnaryVecOpCodegen<tvm::tl::NpuirRsqrt, ElemwiseOp<hfusion::UnaryFn::rsqrt>>(
         op);
   } else if (op->op.same_as(Op::Get("tl.npuir_abs"))) {
     UnaryVecOpCodegen<tvm::tl::NpuirAbs, ElemwiseOp<linalg::UnaryFn::abs>>(op);
