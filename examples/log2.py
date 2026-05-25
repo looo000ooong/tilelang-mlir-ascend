@@ -15,6 +15,7 @@ BLOCK_M = 8
 BLOCK_N = 8
 DTYPE = "float16"
 
+
 def kernel_log2(M, N, block_M, block_N, dtype="float16"):
     m_num = M // block_M
     n_num = N // block_N
@@ -22,8 +23,8 @@ def kernel_log2(M, N, block_M, block_N, dtype="float16"):
 
     @T.prim_func
     def main(
-            A: T.Tensor((M, N), dtype),
-            B: T.Tensor((M, N), dtype),
+        A: T.Tensor((M, N), dtype),
+        B: T.Tensor((M, N), dtype),
     ):
         with T.Kernel(BLOCK_SIZE, is_npu=True) as (cid, _):
             A_VEC = T.alloc_ub((block_M, block_N), dtype)
@@ -41,6 +42,7 @@ def kernel_log2(M, N, block_M, block_N, dtype="float16"):
                     T.copy(A[bx, by], A_VEC)
                     T.vlog2(A_VEC, B_VEC, Tmp)
                     T.copy(B_VEC, B[bx, by])
+
     return main
 
 
@@ -48,18 +50,18 @@ def test_kernel_log2():
     func = kernel_log2(M, N, BLOCK_M, BLOCK_N, DTYPE)
     compiled_kernel = tilelang.compile(func, target="npuir")
 
-    A = torch.abs(torch.randn((M, N), dtype=torch.float16)) + 0.01  
+    A = torch.abs(torch.randn((M, N), dtype=torch.float16)) + 0.01
     A = A.npu()
     B = torch.zeros((M, N), dtype=torch.float16).npu()
 
     compiled_kernel(A, B)
 
     A_cpu = A.cpu()
-    B_cpu = B.cpu()
     ref_cpu = torch.log2(A_cpu)
 
     torch.testing.assert_close(B.cpu(), ref_cpu, rtol=1e-3, atol=1e-3)
     print("\033[92mLog2 kernel accuracy check passed!\033[0m")
+
 
 if __name__ == "__main__":
     test_kernel_log2()
