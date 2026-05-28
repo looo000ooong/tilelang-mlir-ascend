@@ -25,6 +25,23 @@ TVM_REGISTER_PASS_CONFIG_OPTION(kEnablePlanAndUpdateBufferAllocation, Bool);
 
 using namespace tir;
 
+namespace {
+
+constexpr const char *kA5IndirectLoadFeature =
+    "A5 SIMT indirect load phase 1";
+
+bool IsSharedScope(const Buffer &buffer) {
+  return buffer.scope() == "shared" || buffer.scope() == "shared.dyn";
+}
+
+void CheckRank1Region(const Array<Range> &range, const char *name) {
+  ICHECK_EQ(range.size(), 1U)
+      << kA5IndirectLoadFeature << ": expected " << name
+      << " to be a 1D region, got rank " << range.size();
+}
+
+} // namespace
+
 NpuirOperand NpuirOperand::FromExpr(const PrimExpr &expr,
                                     const BufferMap &vmap) {
   if (const auto *call = expr.as<CallNode>()) {
@@ -448,6 +465,61 @@ NpuirGather::NpuirGather(Array<PrimExpr> args, BufferMap vmap) {
   this->indices_range = range;
 }
 
+NpuirIndirectLoad::NpuirIndirectLoad(Array<PrimExpr> args, BufferMap vmap) {
+  ICHECK_EQ(args.size(), 4U)
+      << kA5IndirectLoadFeature
+      << ": expected 4 arguments "
+         "(src_gm_region, indices_ub_region, dst_ub_region, valid_extent), got "
+      << args.size();
+
+  Array<Range> rgs[3];
+  Buffer bf[3];
+  constexpr const char *kArgNames[3] = {"src_gm_region", "indices_ub_region",
+                                        "dst_ub_region"};
+  for (int i = 0; i < 3; ++i) {
+    auto call = args[i].as<CallNode>();
+    ICHECK(call) << kA5IndirectLoadFeature << ": expected " << kArgNames[i]
+                 << " to be a tl.region call";
+    auto region = RegionOp(call->args, vmap);
+    rgs[i] = region.GetRanges();
+    bf[i] = region.GetBuffer();
+    CheckRank1Region(rgs[i], kArgNames[i]);
+  }
+
+  std::tie(this->src, this->indices_ub, this->dst_ub) =
+      std::tie(bf[0], bf[1], bf[2]);
+  std::tie(this->src_range, this->indices_ub_range, this->dst_ub_range) =
+      std::tie(rgs[0], rgs[1], rgs[2]);
+  this->valid_extent = args[3];
+
+  ICHECK(this->valid_extent.defined())
+      << kA5IndirectLoadFeature << ": valid_extent must be defined";
+  ICHECK(this->src.scope() == "global")
+      << kA5IndirectLoadFeature << ": expected src buffer in global scope, got "
+      << this->src.scope();
+  ICHECK(IsSharedScope(this->indices_ub))
+      << kA5IndirectLoadFeature
+      << ": expected indices buffer in shared/shared.dyn scope, got "
+      << this->indices_ub.scope()
+      << ". Use T.copy to stage indices into alloc_shared before T.Parallel.";
+  ICHECK(IsSharedScope(this->dst_ub))
+      << kA5IndirectLoadFeature
+      << ": expected dst buffer in shared/shared.dyn scope, got "
+      << this->dst_ub.scope()
+      << ". Materialize indirect-load results into alloc_shared before T.copy "
+         "writes back to GM.";
+  ICHECK(this->src->dtype == DataType::Float(32))
+      << kA5IndirectLoadFeature << ": expected src dtype float32, got "
+      << this->src->dtype;
+  ICHECK(this->indices_ub->dtype == DataType::Int(32))
+      << kA5IndirectLoadFeature << ": expected IDX_UB dtype int32, got "
+      << this->indices_ub->dtype;
+  ICHECK(this->dst_ub->dtype == this->src->dtype)
+      << kA5IndirectLoadFeature
+      << ": expected O_UB dtype to match src dtype " << this->src->dtype
+      << ", got " << this->dst_ub->dtype;
+}
+
 NpuirArange::NpuirArange(Array<PrimExpr> args, BufferMap vmap) {
   NPUIR_GEN_BUF(args[0])
   this->dst = bf;
@@ -725,6 +797,11 @@ TIR_REGISTER_TL_OP(NpuirGather, npuir_gather)
     .set_num_inputs(3)
     .set_attr<TCallEffectKind>("TCallEffectKind",
                                Integer(CallEffectKind::kOpaque));
+
+TIR_REGISTER_TL_OP(NpuirIndirectLoad, npuir_indirect_load)
+.set_num_inputs(4)
+.set_attr<TCallEffectKind>("TCallEffectKind",
+                          Integer(CallEffectKind::kOpaque));
 
 TIR_REGISTER_TL_OP(NpuirTranspose, npuir_transpose)
     .set_num_inputs(3)
