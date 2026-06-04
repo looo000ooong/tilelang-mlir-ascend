@@ -108,6 +108,7 @@ NPUIR_BINARY_OP_REGISTER(And, and)
 NPUIR_BINARY_OP_REGISTER(Xor, xor)
 NPUIR_BINARY_OP_REGISTER(Pow, pow)
 NPUIR_BINARY_OP_REGISTER(Shl, shl)
+NPUIR_BINARY_OP_REGISTER(FloorDiv, floordiv)
 
 #define NPUIR_UNARY_OP_CTOR(OPNAME, opname)                                    \
   Npuir##OPNAME::Npuir##OPNAME(Array<PrimExpr> args, BufferMap vmap) {         \
@@ -138,7 +139,8 @@ NPUIR_UNARY_OP_CTOR(Sqrt, sqrt)
 NPUIR_UNARY_OP_CTOR(Rsqrt, rsqrt)
 NPUIR_UNARY_OP_CTOR(Abs, abs)
 NPUIR_UNARY_OP_CTOR(Rec, rec)
-NPUIR_UNARY_OP_CTOR(Not, not )
+NPUIR_UNARY_OP_CTOR(Not, not)
+NPUIR_UNARY_OP_CTOR(Floor, floor)
 
 NpuirBrc::NpuirBrc(Array<PrimExpr> args, BufferMap vmap) {
   in = args[0], out = args[1];

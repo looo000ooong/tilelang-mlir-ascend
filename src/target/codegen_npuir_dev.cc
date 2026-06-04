@@ -88,6 +88,7 @@
 #include "bishengir/Dialect/Utils/Util.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "tvm/ir/op.h"
 #include "tvm/runtime/logging.h"
 #include "llvm/Support/Debug.h"
 
@@ -787,16 +788,12 @@ mlir::Type CodeGenTileLangNPUIRDEV::DTypetoMLIRType(DataType t) { // NOLINT(*)
 mlir::Value CodeGenTileLangNPUIRDEV::VisitExpr_(const FloorDivNode *op) {
   auto lhs = MakeValue(op->a);
   auto rhs = MakeValue(op->b);
-  // FIXME: The floor div in python is not the same as arith.divsi in negative
-  // scenarios.
-  mlir::Value mlirVal;
-  if (op->dtype.is_int() || op->dtype.is_uint()) {
-    mlirVal = BinaryOpCodegen<mlir::arith::DivSIOp, std::nullptr_t>(op, nullptr,
-                                                                    lhs, rhs);
-  } else if (op->dtype.is_float()) {
-    mlirVal = BinaryOpCodegen<mlir::arith::DivFOp, std::nullptr_t>(op, nullptr,
-                                                                   lhs, rhs);
+  
+  if (!op->dtype.is_int() && !op->dtype.is_uint()) {
+    LOG(FATAL) << "FloorDiv only supports integer types, but got dtype: " << op->dtype;
   }
+  
+  auto mlirVal = BinaryOpCodegen<mlir::arith::DivSIOp, std::nullptr_t>(op, nullptr, lhs, rhs);
   return mlirVal;
 }
 
@@ -3957,6 +3954,57 @@ void CodeGenTileLangNPUIRDEV::VtanhCodegen(const CallNode *op) {
   }
 }
 
+void CodeGenTileLangNPUIRDEV::VfloordivCodegen(const CallNode *op) {
+  tvm::tl::NpuirFloorDiv npuirop(op->args, this->vmap);
+  auto loc = builder.getUnknownLoc();
+
+  Value src0 = GenExtractSliceFromRegion(npuirop.Src0().GetBuffer(), npuirop.Src0().GetRanges());
+  Value src1 = GenExtractSliceFromRegion(npuirop.Src1().GetBuffer(), npuirop.Src1().GetRanges());
+  const CallNode *region_node_dst = op->args[2].as<CallNode>();
+
+  tvm::tl::RegionOp region_dst_tmp(region_node_dst->args, vmap);
+  Array<Range> dst_range = region_dst_tmp.GetRanges();
+
+  mlir::Value insertBase = NeedGenInsertSlice(region_dst_tmp.GetBuffer(), dst_range, src0);
+  bool needInsertSlice = (insertBase != GetVarValue(region_node_dst));
+
+  auto src0TensorTy = src0.getType().cast<mlir::TensorType>();
+  auto src0Shape = src0TensorTy.getShape();
+  auto src1TensorTy = src1.getType().cast<mlir::TensorType>();
+  auto src1Shape = src1TensorTy.getShape();
+  auto dstTensorTy = insertBase.getType().cast<mlir::TensorType>();
+  auto dstShape = dstTensorTy.getShape();
+
+  mlir::DenseI64ArrayAttr transpose = builder.getDenseI64ArrayAttr({});
+  ArrayRef<int64_t> shape;
+  if (auto shapedType = insertBase.getType().dyn_cast<ShapedType>()) {
+    shape = shapedType.getShape();
+  }
+  auto dims0 = getBroadcastDim(src0Shape, dstShape);
+  auto brc0 = builder.getDenseI64ArrayAttr(dims0);
+  auto dims1 = getBroadcastDim(src1Shape, dstShape);
+  auto brc1 = builder.getDenseI64ArrayAttr(dims1);
+  llvm::SetVector<int64_t> dims(llvm::from_range_t(), dims0);
+  dims.insert_range(dims1);
+  mlir::DenseI64ArrayAttr broadcast =
+      builder.getDenseI64ArrayAttr(dims.takeVector());
+  src0 = broadcastOrTranspose(src0, insertBase, brc0, transpose, builder);
+  src1 = broadcastOrTranspose(src1, insertBase, brc1, transpose, builder);
+  
+  if (src0TensorTy.getElementType().isa<FloatType>() || 
+      src1TensorTy.getElementType().isa<FloatType>()) {
+    LOG(FATAL) << "VfloordivCodegen only supports integer types, but got float type";
+  }
+
+  Value Op = builder.create<mlir::arith::DivSIOp>(loc, src0, src1);
+  
+  mlir::Value result = needInsertSlice
+    ? ReshapeCastAndInsertSlice(Op, GetVarValue(region_node_dst), dst_range)
+    : Op;
+
+  SetVarValue(region_node_dst, result);
+}
+
 /// Generate hivm.hir.vreduce for tl.npuir_reshape.
 /// before:
 ///    T.npuir_reshape(A, B)
@@ -4215,6 +4263,8 @@ mlir::Value CodeGenTileLangNPUIRDEV::VisitExpr_(const CallNode *op) {
     CreateHIVMBinaryVectorOp<ElemwiseOp<linalg::BinaryFn::add>>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_exp"))) {
     UnaryVecOpCodegen<tvm::tl::NpuirExp, ElemwiseOp<linalg::UnaryFn::exp>>(op);
+  } else if (op->op.same_as(Op::Get("tl.npuir_floor"))) {
+    UnaryVecOpCodegen<tvm::tl::NpuirFloor, ElemwiseOp<linalg::UnaryFn::floor>>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_ln"))) {
     UnaryVecOpCodegen<tvm::tl::NpuirLn, ElemwiseOp<linalg::UnaryFn::log>>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_relu"))) {
@@ -4316,6 +4366,8 @@ mlir::Value CodeGenTileLangNPUIRDEV::VisitExpr_(const CallNode *op) {
     VerfCodegen(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_vtanh"))) {
     VtanhCodegen(op);
+  } else if (op->op.same_as(Op::Get("tl.npuir_floordiv"))) {
+    VfloordivCodegen(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_debug_print_var")) ||
              op->op.same_as(Op::Get("tl.npuir_debug_print_buffer_value"))) {
     DebugPrintCodegen(op);

@@ -185,7 +185,7 @@ def compute_reference(A, B, op_name):
     elif op_name == "min":
         return torch.minimum(A, B)
     elif op_name == "floordiv":
-        return torch.div(A, B, rounding_mode='floor')
+        return torch.div(A, B, rounding_mode='trunc')
     else:
         raise ValueError(f"Unsupported op: {op_name}")
 
