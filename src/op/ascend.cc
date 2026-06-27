@@ -27,8 +27,7 @@ using namespace tir;
 
 namespace {
 
-constexpr const char *kA5IndirectLoadFeature =
-    "A5 SIMT indirect load phase 1";
+constexpr const char *kA5IndirectLoadFeature = "A5 SIMT indirect load phase 1";
 
 bool IsSharedScope(const Buffer &buffer) {
   return buffer.scope() == "shared" || buffer.scope() == "shared.dyn";
@@ -531,9 +530,8 @@ NpuirIndirectLoad::NpuirIndirectLoad(Array<PrimExpr> args, BufferMap vmap) {
       << kA5IndirectLoadFeature << ": expected IDX_UB dtype int32, got "
       << this->indices_ub->dtype;
   ICHECK(this->dst_ub->dtype == this->src->dtype)
-      << kA5IndirectLoadFeature
-      << ": expected O_UB dtype to match src dtype " << this->src->dtype
-      << ", got " << this->dst_ub->dtype;
+      << kA5IndirectLoadFeature << ": expected O_UB dtype to match src dtype "
+      << this->src->dtype << ", got " << this->dst_ub->dtype;
 }
 
 NpuirArange::NpuirArange(Array<PrimExpr> args, BufferMap vmap) {
@@ -815,9 +813,9 @@ TIR_REGISTER_TL_OP(NpuirGather, npuir_gather)
                                Integer(CallEffectKind::kOpaque));
 
 TIR_REGISTER_TL_OP(NpuirIndirectLoad, npuir_indirect_load)
-.set_num_inputs(4)
-.set_attr<TCallEffectKind>("TCallEffectKind",
-                          Integer(CallEffectKind::kOpaque));
+    .set_num_inputs(4)
+    .set_attr<TCallEffectKind>("TCallEffectKind",
+                               Integer(CallEffectKind::kOpaque));
 
 TIR_REGISTER_TL_OP(NpuirTranspose, npuir_transpose)
     .set_num_inputs(3)

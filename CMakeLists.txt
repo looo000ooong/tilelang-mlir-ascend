@@ -213,6 +213,7 @@ endif()
 if(USE_NPUIR)
   if(TILE_LANG_ENABLE_NPUIR_A5)
     tilelang_file_glob(GLOB TILE_LANG_NPUIR_SRCS
+      src/target/codegen_npuir.cc
       src/target/codegen_npuir_api_a5.cc
       src/target/codegen_npuir_dev_a5.cc
       src/target/rt_mod_npuir.cc
@@ -322,11 +323,11 @@ target_link_libraries(
   tilelang_module
   PUBLIC
   tvm
-  zstd
-  z
   -Wl,--start-group
   ${NPUIR_LIBS}
   -Wl,--end-group
+  zstd
+  z
 )
 if(USE_NPUIR)
   # TODO: Use Tilelangir Dialect in tilelang_module

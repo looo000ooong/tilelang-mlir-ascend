@@ -85,12 +85,10 @@ void DebugDumpStmt(const std::string &label, const Stmt &stmt) {
   if (!SimtDebugEnabled()) {
     return;
   }
-  std::cerr << "[NpuSimtIndirectLoad] " << label << ":\n"
-            << stmt << "\n";
+  std::cerr << "[NpuSimtIndirectLoad] " << label << ":\n" << stmt << "\n";
 }
 
-bool MatchLaneIndex(const PrimExpr &expr, const Var &loop_var,
-                    PrimExpr *base) {
+bool MatchLaneIndex(const PrimExpr &expr, const Var &loop_var, PrimExpr *base) {
   if (SameExpr(expr, loop_var)) {
     *base = make_zero(loop_var.dtype());
     return true;
@@ -199,7 +197,7 @@ bool MatchStoreBody(const Stmt &stmt, const Var &loop_var,
 }
 
 class NpuSimtIndirectLoadRewriter : public StmtMutator {
- public:
+public:
   Stmt VisitStmt_(const ForNode *op) final {
     if (op->kind != ForKind::kParallel) {
       return StmtMutator::VisitStmt_(op);
@@ -214,7 +212,7 @@ class NpuSimtIndirectLoadRewriter : public StmtMutator {
     return StmtMutator::VisitStmt_(op);
   }
 
- private:
+private:
   Optional<Stmt> TryRewrite(const ForNode *op) {
     PrimExpr valid_extent = op->extent;
     Stmt body = op->body;
@@ -298,12 +296,12 @@ class NpuSimtIndirectLoadRewriter : public StmtMutator {
                               make_const(DataType::Int(32), 1));
       idx_region = MakeRegion(pattern.idx_load->buffer, zero, 1, block);
     } else {
-      src_region = MakeRegion2D(
-          pattern.src_load->buffer, pattern.src_row, zero, 1,
-          make_const(DataType::Int(32), 1), pattern.src_load->buffer->shape[1]);
-      idx_region = MakeRegion2D(
-          pattern.idx_load->buffer, pattern.idx_row, pattern.idx_lane_base, 1,
-          make_const(DataType::Int(32), 1), block);
+      src_region = MakeRegion2D(pattern.src_load->buffer, pattern.src_row, zero,
+                                1, make_const(DataType::Int(32), 1),
+                                pattern.src_load->buffer->shape[1]);
+      idx_region = MakeRegion2D(pattern.idx_load->buffer, pattern.idx_row,
+                                pattern.idx_lane_base, 1,
+                                make_const(DataType::Int(32), 1), block);
     }
     PrimExpr dst_region = MakeRegion(pattern.dst_buffer, zero, 2, block);
 
@@ -315,7 +313,7 @@ class NpuSimtIndirectLoadRewriter : public StmtMutator {
   }
 };
 
-}  // namespace
+} // namespace
 
 using namespace tir::transform;
 
@@ -333,5 +331,5 @@ tvm::transform::Pass NpuSimtIndirectLoad() {
 TVM_REGISTER_GLOBAL("tl.transform.NpuSimtIndirectLoad")
     .set_body_typed(NpuSimtIndirectLoad);
 
-}  // namespace tl
-}  // namespace tvm
+} // namespace tl
+} // namespace tvm
