@@ -16,6 +16,10 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include <cstdlib>
+#include <iostream>
+#include <string>
+
 namespace tvm {
 namespace tl {
 
@@ -25,11 +29,20 @@ namespace {
 
 constexpr const char *kFeature = "A5 SIMT indirect load phase 1";
 
+enum class IndirectLoadKind {
+  kRank1,
+  kLutRow2D,
+};
+
 struct IndirectLoadPattern {
   const BufferLoadNode *src_load{nullptr};
   const BufferLoadNode *idx_load{nullptr};
   Buffer dst_buffer;
   PrimExpr valid_extent;
+  IndirectLoadKind kind{IndirectLoadKind::kRank1};
+  PrimExpr src_row;
+  PrimExpr idx_row;
+  PrimExpr idx_lane_base;
 };
 
 bool IsSharedScope(const Buffer &buffer) {
@@ -47,6 +60,55 @@ PrimExpr MakeRegion(Buffer buffer, PrimExpr offset, int access_mask,
   Array<PrimExpr> args = {load, make_const(DataType::Int(32), access_mask),
                           extent};
   return Call(DataType::Handle(), region_op, args);
+}
+
+PrimExpr MakeRegion2D(Buffer buffer, PrimExpr offset0, PrimExpr offset1,
+                      int access_mask, PrimExpr extent0, PrimExpr extent1) {
+  Op region_op = Op::Get("tl.region");
+  PrimExpr load = BufferLoad(buffer, {offset0, offset1});
+  Array<PrimExpr> args = {load, make_const(DataType::Int(32), access_mask),
+                          extent0, extent1};
+  return Call(DataType::Handle(), region_op, args);
+}
+
+bool SimtDebugEnabled() {
+  const char *value = std::getenv("TILELANG_SIMT_DUMP_TIR");
+  if (value == nullptr) {
+    return false;
+  }
+  std::string normalized(value);
+  return !(normalized.empty() || normalized == "0" || normalized == "false" ||
+           normalized == "False" || normalized == "FALSE");
+}
+
+void DebugDumpStmt(const std::string &label, const Stmt &stmt) {
+  if (!SimtDebugEnabled()) {
+    return;
+  }
+  std::cerr << "[NpuSimtIndirectLoad] " << label << ":\n"
+            << stmt << "\n";
+}
+
+bool MatchLaneIndex(const PrimExpr &expr, const Var &loop_var,
+                    PrimExpr *base) {
+  if (SameExpr(expr, loop_var)) {
+    *base = make_zero(loop_var.dtype());
+    return true;
+  }
+
+  const auto *add = expr.as<AddNode>();
+  if (!add) {
+    return false;
+  }
+  if (SameExpr(add->a, loop_var)) {
+    *base = add->b;
+    return true;
+  }
+  if (SameExpr(add->b, loop_var)) {
+    *base = add->a;
+    return true;
+  }
+  return false;
 }
 
 PrimExpr MatchTailMask(PrimExpr condition, const Var &loop_var) {
@@ -89,20 +151,50 @@ bool MatchStoreBody(const Stmt &stmt, const Var &loop_var,
   }
 
   const auto *src_load = store->value.as<BufferLoadNode>();
-  if (!src_load || src_load->indices.size() != 1U) {
+  if (!src_load) {
     return false;
   }
-  const auto *idx_load = src_load->indices[0].as<BufferLoadNode>();
-  if (!idx_load || idx_load->indices.size() != 1U) {
+
+  if (src_load->indices.size() == 1U) {
+    // 1D 原始模式： O_UB[i] = X[IDX_UB[i]]
+    const auto *idx_load = src_load->indices[0].as<BufferLoadNode>();
+    if (!idx_load || idx_load->indices.size() != 1U) {
+      return false;
+    }
+    if (!SameExpr(idx_load->indices[0], loop_var)) {
+      return false;
+    }
+
+    pattern->src_load = src_load;
+    pattern->idx_load = idx_load;
+    pattern->dst_buffer = store->buffer;
+    pattern->kind = IndirectLoadKind::kRank1;
+    return true;
+  }
+
+  // 2D LUT-row pattern: O_UB[m] = LUT_SHARED[s, CODES[s, m]]
+  if (src_load->indices.size() != 2U) {
     return false;
   }
-  if (!SameExpr(idx_load->indices[0], loop_var)) {
+  const auto *idx_load = src_load->indices[1].as<BufferLoadNode>();
+  if (!idx_load || idx_load->indices.size() != 2U) {
+    return false;
+  }
+  if (!SameExpr(src_load->indices[0], idx_load->indices[0])) {
+    return false;
+  }
+  PrimExpr lane_base;
+  if (!MatchLaneIndex(idx_load->indices[1], loop_var, &lane_base)) {
     return false;
   }
 
   pattern->src_load = src_load;
   pattern->idx_load = idx_load;
   pattern->dst_buffer = store->buffer;
+  pattern->kind = IndirectLoadKind::kLutRow2D;
+  pattern->src_row = src_load->indices[0];
+  pattern->idx_row = idx_load->indices[0];
+  pattern->idx_lane_base = lane_base;
   return true;
 }
 
@@ -112,6 +204,8 @@ class NpuSimtIndirectLoadRewriter : public StmtMutator {
     if (op->kind != ForKind::kParallel) {
       return StmtMutator::VisitStmt_(op);
     }
+
+    DebugDumpStmt("visit T.Parallel", GetRef<For>(op));
 
     Optional<Stmt> rewritten = TryRewrite(op);
     if (rewritten.defined()) {
@@ -125,8 +219,6 @@ class NpuSimtIndirectLoadRewriter : public StmtMutator {
     PrimExpr valid_extent = op->extent;
     Stmt body = op->body;
 
-    // Unsupported T.Parallel forms are left untouched so the regular NPUIR
-    // vectorization path can still handle them.
     if (const auto *if_node = op->body.as<IfThenElseNode>()) {
       if (if_node->else_case.defined()) {
         return NullOpt;
@@ -147,13 +239,13 @@ class NpuSimtIndirectLoadRewriter : public StmtMutator {
     if (!CanRewriteBoundary(op, pattern)) {
       return NullOpt;
     }
-    return BuildIndirectLoad(op, pattern);
+    Stmt rewritten = BuildIndirectLoad(op, pattern);
+    DebugDumpStmt("rewritten TIR", rewritten);
+    return rewritten;
   }
 
   bool CanRewriteBoundary(const ForNode *op,
                           const IndirectLoadPattern &pattern) {
-    // Boundary misses are not errors at this TIR stage. Leave the original
-    // loop intact so NpuLoopVectorize can still handle the SIMD path.
     const auto *extent = op->extent.as<IntImmNode>();
     if (!extent || extent->value <= 0 || !is_zero(op->min)) {
       return false;
@@ -163,12 +255,26 @@ class NpuSimtIndirectLoadRewriter : public StmtMutator {
       return false;
     }
 
-    if (pattern.src_load->buffer.scope() != "global") {
-      return false;
-    }
-    if (!IsSharedScope(pattern.idx_load->buffer) ||
-        !IsSharedScope(pattern.dst_buffer)) {
-      return false;
+    if (pattern.kind == IndirectLoadKind::kRank1) {
+      if (pattern.src_load->buffer.scope() != "global") {
+        return false;
+      }
+      if (!IsSharedScope(pattern.idx_load->buffer) ||
+          !IsSharedScope(pattern.dst_buffer)) {
+        return false;
+      }
+    } else {
+      if (pattern.src_load->buffer.scope() != "global" &&
+          !IsSharedScope(pattern.src_load->buffer)) {
+        return false;
+      }
+      if (pattern.idx_load->buffer.scope() != "global" &&
+          !IsSharedScope(pattern.idx_load->buffer)) {
+        return false;
+      }
+      if (!IsSharedScope(pattern.dst_buffer)) {
+        return false;
+      }
     }
 
     if (pattern.src_load->buffer->dtype != DataType::Float(32)) {
@@ -185,11 +291,20 @@ class NpuSimtIndirectLoadRewriter : public StmtMutator {
     PrimExpr zero = make_zero(op->loop_var.dtype());
     PrimExpr block = op->extent;
 
-    // The replacement is an internal TileLang op. Developer-mode codegen lowers
-    // it to the backend-recognized triton_indirect_load call.
-    PrimExpr src_region = MakeRegion(pattern.src_load->buffer, zero, 1,
-                                     make_const(DataType::Int(32), 1));
-    PrimExpr idx_region = MakeRegion(pattern.idx_load->buffer, zero, 1, block);
+    PrimExpr src_region;
+    PrimExpr idx_region;
+    if (pattern.kind == IndirectLoadKind::kRank1) {
+      src_region = MakeRegion(pattern.src_load->buffer, zero, 1,
+                              make_const(DataType::Int(32), 1));
+      idx_region = MakeRegion(pattern.idx_load->buffer, zero, 1, block);
+    } else {
+      src_region = MakeRegion2D(
+          pattern.src_load->buffer, pattern.src_row, zero, 1,
+          make_const(DataType::Int(32), 1), pattern.src_load->buffer->shape[1]);
+      idx_region = MakeRegion2D(
+          pattern.idx_load->buffer, pattern.idx_row, pattern.idx_lane_base, 1,
+          make_const(DataType::Int(32), 1), block);
+    }
     PrimExpr dst_region = MakeRegion(pattern.dst_buffer, zero, 2, block);
 
     Op indirect_load_op = Op::Get("tl.npuir_indirect_load");

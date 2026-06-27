@@ -88,6 +88,7 @@
 #include "bishengir/Dialect/Utils/Util.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "tvm/ir/op.h"
 #include "tvm/runtime/logging.h"
 #include "llvm/Support/Debug.h"
 
@@ -766,16 +767,12 @@ mlir::Type CodeGenTileLangNPUIRDEVA5::DTypetoMLIRType(DataType t) { // NOLINT(*)
 mlir::Value CodeGenTileLangNPUIRDEVA5::VisitExpr_(const FloorDivNode *op) {
   auto lhs = MakeValue(op->a);
   auto rhs = MakeValue(op->b);
-  // FIXME: The floor div in python is not the same as arith.divsi in negative
-  // scenarios.
-  mlir::Value mlirVal;
-  if (op->dtype.is_int() || op->dtype.is_uint()) {
-    mlirVal = BinaryOpCodegen<mlir::arith::DivSIOp, std::nullptr_t>(op, nullptr,
-                                                                    lhs, rhs);
-  } else if (op->dtype.is_float()) {
-    mlirVal = BinaryOpCodegen<mlir::arith::DivFOp, std::nullptr_t>(op, nullptr,
-                                                                   lhs, rhs);
+
+  if (!op->dtype.is_int() && !op->dtype.is_uint()) {
+    LOG(FATAL) << "FloorDiv only supports integer types, but got dtype: " << op->dtype;
   }
+
+  auto mlirVal = BinaryOpCodegen<mlir::arith::DivSIOp, std::nullptr_t>(op, nullptr, lhs, rhs);
   return mlirVal;
 }
 
@@ -1992,7 +1989,23 @@ mlir::Value CodeGenTileLangNPUIRDEVA5::BinaryOpCodegen(const PrimExprNode *op,
   // duplicated MLIR Op
   std::pair<bool, mlir::Value> result = CheckPrimExprMap(op);
   if (result.first) {
-    return result.second;
+    mlir::Value cached = result.second;
+
+    // Only reuse a cached binary op when it was generated from the current
+    // operands. The same PrimExprNode can be revisited with remapped SSA values
+    // while lowering loops, so blindly returning the cached value may reuse an
+    // operation from an earlier operand context.
+    if (auto *defOp = cached.getDefiningOp()) {
+      bool operandsMatch = false;
+      if (defOp->getNumOperands() >= 2) {
+        operandsMatch =
+            (defOp->getOperand(0) == lhs && defOp->getOperand(1) == rhs);
+      }
+
+      if (operandsMatch) {
+        return cached;
+      }
+    }
   }
   mlir::Value mlirVal;
   if constexpr (std::is_same_v<U, std::nullptr_t>) {
@@ -2492,21 +2505,128 @@ void CodeGenTileLangNPUIRDEVA5::VreduceCodegen(const CallNode *op) {
   mlir::Value dst = GenExtractSliceFromRegion(npuirop.dst, npuirop.dst_range);
 
   auto loc = builder.getUnknownLoc();
-  auto elemTy = src.getType().cast<mlir::RankedTensorType>().getElementType();
+  auto srcRankedTy = src.getType().cast<mlir::RankedTensorType>();
+  auto elemTy = srcRankedTy.getElementType();
+  auto srcShape = srcRankedTy.getShape();
+  int srcRank = srcShape.size();
+  int numReduceDims = npuirop.reduce_dims.size();
+
+  DenseSet<int64_t> reduceDimSet(npuirop.reduce_dims.begin(), npuirop.reduce_dims.end());
+  llvm::SmallVector<int64_t> naturalReduceShape;
+  for (int i = 0; i < srcRank; ++i) {
+    if (!reduceDimSet.contains(i)) {
+      naturalReduceShape.push_back(srcShape[i]);
+    }
+  }
+  int naturalReduceRank = naturalReduceShape.size();
+
   auto dstRankedTy = dst.getType().cast<mlir::RankedTensorType>();
   auto dstShape = dstRankedTy.getShape();
   int dstRank = dstShape.size();
 
-  llvm::SmallVector<int64_t> squeezeDimsList(
-      npuirop.reduce_dims.begin(),
-      npuirop.reduce_dims.end()
-  );
+  llvm::SmallVector<int64_t> squeezeDimsList;
+
+  if (dstRank == naturalReduceRank + numReduceDims) {
+    bool valid = true;
+    for (int64_t dim : npuirop.reduce_dims) {
+      if (dim >= dstRank || dstShape[dim] != 1) {
+        valid = false;
+        break;
+      }
+    }
+    if (valid) {
+      squeezeDimsList.assign(npuirop.reduce_dims.begin(), npuirop.reduce_dims.end());
+    }
+  }
+
+  int squeezedDstRank = dstRank - squeezeDimsList.size();
+  if (squeezedDstRank != naturalReduceRank) {
+    emitError(loc) << "Reduce shape mismatch: dst rank " << dstRank
+                   << " after squeezing " << squeezeDimsList.size() << " dims "
+                   << "should equal natural reduce rank " << naturalReduceRank
+                   << "\nInput shape: " << srcShape
+                   << "\nReduce dims: " << npuirop.reduce_dims
+                   << "\nExpected natural shape: " << naturalReduceShape
+                   << "\nActual dst shape: " << dstShape;
+    return;
+  }
+
+  llvm::SmallVector<int64_t> squeezedDstShape;
+  DenseSet<int64_t> squeezeDimSet(squeezeDimsList.begin(), squeezeDimsList.end());
+  for (int i = 0; i < dstRank; ++i) {
+    if (!squeezeDimSet.contains(i)) {
+      squeezedDstShape.push_back(dstShape[i]);
+    }
+  }
+  if (squeezedDstShape != naturalReduceShape) {
+    emitError(loc) << "Reduce shape mismatch: dst after squeeze should be " << naturalReduceShape
+                   << ", but got " << squeezedDstShape
+                   << "\nInput shape: " << srcShape
+                   << "\nReduce dims: " << npuirop.reduce_dims
+                   << "\nActual dst shape: " << dstShape;
+    return;
+  }
+
+  mlir::Value initValue;
+  if (npuirop.reduce_mode == "sum") {
+    initValue = builder.create<mlir::arith::ConstantOp>(loc, elemTy, builder.getZeroAttr(elemTy));
+  } else if (npuirop.reduce_mode == "max") {
+    if (elemTy.isa<mlir::FloatType>()) {
+      auto floatTy = elemTy.cast<mlir::FloatType>();
+      initValue = builder.create<mlir::arith::ConstantOp>(
+          loc, elemTy,
+          builder.getFloatAttr(floatTy, llvm::APFloat::getInf(floatTy.getFloatSemantics(), true)));
+    } else {
+      auto intTy = elemTy.cast<mlir::IntegerType>();
+      initValue = builder.create<mlir::arith::ConstantOp>(
+          loc, elemTy,
+          builder.getIntegerAttr(intTy, llvm::APInt::getMinValue(intTy.getWidth())));
+    }
+  } else if (npuirop.reduce_mode == "min") {
+    if (elemTy.isa<mlir::FloatType>()) {
+      auto floatTy = elemTy.cast<mlir::FloatType>();
+      initValue = builder.create<mlir::arith::ConstantOp>(
+          loc, elemTy,
+          builder.getFloatAttr(floatTy, llvm::APFloat::getInf(floatTy.getFloatSemantics(), false)));
+    } else {
+      auto intTy = elemTy.cast<mlir::IntegerType>();
+      initValue = builder.create<mlir::arith::ConstantOp>(
+          loc, elemTy,
+          builder.getIntegerAttr(intTy, llvm::APInt::getMaxValue(intTy.getWidth())));
+    }
+  } else if (npuirop.reduce_mode == "prod") {
+    initValue = builder.create<mlir::arith::ConstantOp>(loc, elemTy, builder.getOneAttr(elemTy));
+  } else if (npuirop.reduce_mode == "any" || npuirop.reduce_mode == "ori") {
+    initValue = builder.create<mlir::arith::ConstantOp>(loc, elemTy, builder.getZeroAttr(elemTy));
+  } else if (npuirop.reduce_mode == "all") {
+    if (elemTy.isa<mlir::IntegerType>()) {
+      auto intTy = elemTy.cast<mlir::IntegerType>();
+      initValue = builder.create<mlir::arith::ConstantOp>(
+          loc, elemTy,
+          builder.getIntegerAttr(intTy, llvm::APInt::getAllOnes(intTy.getWidth())));
+    } else {
+      initValue = builder.create<mlir::arith::ConstantOp>(loc, elemTy, builder.getZeroAttr(elemTy));
+    }
+  } else if (npuirop.reduce_mode == "xori") {
+    initValue = builder.create<mlir::arith::ConstantOp>(loc, elemTy, builder.getZeroAttr(elemTy));
+  } else if (npuirop.reduce_mode == "none") {
+    initValue = builder.create<mlir::arith::ConstantOp>(loc, elemTy, builder.getZeroAttr(elemTy));
+  } else {
+    emitError(loc) << "unknown reduce_mode: " << npuirop.reduce_mode;
+    return;
+  }
+
+  auto fillOp = builder.create<mlir::linalg::FillOp>(loc, ValueRange{initValue}, ValueRange{dst});
+  dst = fillOp.getResult(0);
 
   mlir::Value squeezedInit = dst;
   if (!squeezeDimsList.empty()) {
-    auto squeezed = squeezeDims(builder, loc, dst, squeezeDimsList);
+    auto staticDstType = RankedTensorType::get(dstRankedTy.getShape(), elemTy);
+    squeezedInit = builder.create<tensor::CastOp>(loc, staticDstType, dst);
+
+    auto squeezed = squeezeDims(builder, loc, squeezedInit, squeezeDimsList);
     if (failed(squeezed)) {
-      emitError(loc, "squeeze failed");
+      emitError(loc) << "squeeze failed for reduce operation";
       return;
     }
     squeezedInit = *squeezed;
@@ -2597,11 +2717,11 @@ void CodeGenTileLangNPUIRDEVA5::VreduceCodegen(const CallNode *op) {
     } else if (npuirop.reduce_mode == "none") {
       result = accumElem;
     } else {
-      emitError(loc, "unknown reduce_mode: " + npuirop.reduce_mode);
+      emitError(loc) << "unknown reduce_mode: " << npuirop.reduce_mode;
       return;
     }
-
     // TODO: max_with_index_left/max_with_index_right/min_with_index_left/min_with_index_right
+
     builder.create<mlir::linalg::YieldOp>(loc, result);
   }
 
@@ -2609,7 +2729,7 @@ void CodeGenTileLangNPUIRDEVA5::VreduceCodegen(const CallNode *op) {
   if (!squeezeDimsList.empty()) {
     auto unsqueezed = unsqueezeDims(builder, loc, reducedResult, squeezeDimsList);
     if (failed(unsqueezed)) {
-      emitError(loc, "unsqueeze failed");
+      emitError(loc) << "unsqueeze failed for reduce operation";
       return;
     }
     reducedResult = *unsqueezed;
@@ -2737,13 +2857,21 @@ void CodeGenTileLangNPUIRDEVA5::VIndirectLoadCodegen(const CallNode *op) {
   tvm::tl::NpuirIndirectLoad npuirop(op->args, this->vmap);
 
   // The transform pass already checks the source pattern. Codegen re-checks
-  // the MLIR-facing shape contract before creating tensor values.
-  ICHECK_EQ(npuirop.indices_ub_range.size(), 1U)
-      << kFeature << ": expected IDX_UB rank 1 in codegen";
+  // the MLIR-facing shape contract before creating tensor values. Phase 1
+  // supports the original rank-1 gather and the minimal 2D LUT-row pattern:
+  //   O_UB[m] = LUT[s, CODES[s, m]]
+  ICHECK(npuirop.indices_ub_range.size() == 1U ||
+         npuirop.indices_ub_range.size() == 2U)
+      << kFeature << ": expected IDX region rank 1 or 2 in codegen";
   ICHECK_EQ(npuirop.dst_ub_range.size(), 1U)
       << kFeature << ": expected O_UB rank 1 in codegen";
-  ICHECK(is_zero(npuirop.indices_ub_range[0]->min))
-      << kFeature << ": expected IDX_UB region offset 0";
+  if (npuirop.indices_ub_range.size() == 1U) {
+    ICHECK(is_zero(npuirop.indices_ub_range[0]->min))
+        << kFeature << ": expected IDX_UB region offset 0";
+  } else {
+    ICHECK(is_one(npuirop.indices_ub_range[0]->extent))
+        << kFeature << ": expected rank-2 IDX_UB row extent 1";
+  }
   ICHECK(is_zero(npuirop.dst_ub_range[0]->min))
       << kFeature << ": expected O_UB region offset 0";
 
@@ -2753,9 +2881,88 @@ void CodeGenTileLangNPUIRDEVA5::VIndirectLoadCodegen(const CallNode *op) {
                        << *block;
 
   mlir::Location loc = builder.getUnknownLoc();
-  mlir::Value src = GetVarValue(npuirop.src);
-  mlir::Value idx_i32 = GenExtractSliceFromRegion(npuirop.indices_ub,
-                                                  npuirop.indices_ub_range);
+  auto normalize_integer_scalar_to_i64 = [&](mlir::Value value) -> mlir::Value {
+    if (value.getType().isIndex()) {
+      return builder.create<mlir::arith::IndexCastOp>(
+          loc, builder.getI64Type(), value);
+    }
+    auto int_type = mlir::dyn_cast<mlir::IntegerType>(value.getType());
+    ICHECK(int_type) << kFeature << ": expected integer scalar value";
+    if (int_type.getWidth() < 64) {
+      return builder.create<mlir::arith::ExtSIOp>(
+          loc, builder.getI64Type(), value);
+    }
+    if (int_type.getWidth() > 64) {
+      return builder.create<mlir::arith::TruncIOp>(
+          loc, builder.getI64Type(), value);
+    }
+    return value;
+  };
+
+  auto source_as_flat_memref = [&]() -> mlir::Value {
+    mlir::Value src_value = GetVarValue(npuirop.src);
+    if (auto tensor_type =
+            mlir::dyn_cast<mlir::RankedTensorType>(src_value.getType())) {
+      auto memref_type = mlir::MemRefType::get(tensor_type.getShape(),
+                                               tensor_type.getElementType());
+      src_value = builder.create<mlir::bufferization::ToMemrefOp>(
+          loc, memref_type, src_value);
+    }
+    ICHECK(mlir::isa<mlir::MemRefType>(src_value.getType()))
+        << kFeature << ": expected source to be a memref";
+    auto src_memref_type = mlir::cast<mlir::MemRefType>(src_value.getType());
+    if (src_memref_type.getRank() <= 1) {
+      return src_value;
+    }
+
+    if (auto reinterpret_op =
+            src_value.getDefiningOp<mlir::memref::ReinterpretCastOp>()) {
+      mlir::Value flat_source = reinterpret_op.getSource();
+      if (auto flat_source_type =
+              mlir::dyn_cast<mlir::MemRefType>(flat_source.getType())) {
+        auto static_offsets = reinterpret_op.getStaticOffsets();
+        if (static_offsets.size() == 1 && static_offsets[0] == 0 &&
+            flat_source_type.getRank() <= 1 &&
+            flat_source_type.getElementType() ==
+                src_memref_type.getElementType()) {
+          return flat_source;
+        }
+      }
+    }
+
+    for (int64_t dim : src_memref_type.getShape()) {
+      ICHECK(!mlir::ShapedType::isDynamic(dim))
+          << kFeature << ": expected static source shape for flattening";
+    }
+    llvm::SmallVector<mlir::ReassociationIndices> reassociation(1);
+    for (int64_t dim = 0; dim < src_memref_type.getRank(); ++dim) {
+      reassociation[0].push_back(dim);
+    }
+    auto collapse_op = builder.create<mlir::memref::CollapseShapeOp>(
+        loc, src_value, reassociation);
+    return collapse_op.getResult();
+  };
+
+  auto extract_indices_tensor = [&]() -> mlir::Value {
+    mlir::Value base = GetVarValue(npuirop.indices_ub);
+    mlir::Value idx;
+    if (mlir::isa<mlir::MemRefType>(base.getType())) {
+      mlir::Value view =
+          GenSubviewFromRegion(npuirop.indices_ub, npuirop.indices_ub_range);
+      idx = builder.create<mlir::bufferization::ToTensorOp>(
+          loc, view, /*restrict=*/true, /*writable=*/false);
+    } else {
+      idx = GenExtractSliceFromRegion(npuirop.indices_ub,
+                                      npuirop.indices_ub_range);
+    }
+    llvm::SmallVector<int64_t> shape{*block};
+    llvm::SmallVector<mlir::OpFoldResult> shape_ofr{
+        builder.getIndexAttr(*block)};
+    return ReshapeTensorImpl(idx, shape, shape_ofr);
+  };
+
+  mlir::Value src = source_as_flat_memref();
+  mlir::Value idx_i32 = extract_indices_tensor();
   mlir::Value dst = GetVarValue(npuirop.dst_ub);
   auto dst_type = mlir::dyn_cast<mlir::RankedTensorType>(dst.getType());
   ICHECK(dst_type) << kFeature << ": expected O_UB to be a ranked tensor";
@@ -2775,6 +2982,30 @@ void CodeGenTileLangNPUIRDEVA5::VIndirectLoadCodegen(const CallNode *op) {
       mlir::RankedTensorType::get({*block}, builder.getI64Type());
   mlir::Value idx_i64 =
       builder.create<mlir::arith::ExtSIOp>(loc, i64_tensor_type, idx_i32);
+
+  PrimExpr src_base_expr = tir::make_const(DataType::Int(64), 0);
+  if (npuirop.src_range.size() == 1U) {
+    src_base_expr = npuirop.src_range[0]->min;
+  } else if (npuirop.src_range.size() == 2U) {
+    src_base_expr =
+        npuirop.src_range[0]->min * npuirop.src->shape[1] +
+        npuirop.src_range[1]->min;
+  } else {
+    ICHECK(false) << kFeature << ": expected src region rank 1 or 2";
+  }
+  if (!is_zero(src_base_expr)) {
+    mlir::Value src_base =
+        normalize_integer_scalar_to_i64(MakeValue(src_base_expr));
+    auto base_empty = builder.create<mlir::tensor::EmptyOp>(
+        loc, llvm::ArrayRef<int64_t>{*block}, builder.getI64Type());
+    mlir::Value base_tensor =
+        builder
+            .create<mlir::linalg::FillOp>(loc, src_base,
+                                          base_empty.getResult())
+            ->getResult(0);
+    idx_i64 =
+        builder.create<mlir::arith::AddIOp>(loc, idx_i64, base_tensor);
+  }
 
   // Materialize lanes as a Triton-style make_range linalg op. The attributes
   // are consumed by the downstream compiler and avoid a runtime arange symbol.
@@ -3699,6 +3930,62 @@ void CodeGenTileLangNPUIRDEVA5::VtanhCodegen(const CallNode *op) {
   }
 }
 
+void CodeGenTileLangNPUIRDEVA5::VfloordivCodegen(const CallNode *op) {
+  auto loc = builder.getUnknownLoc();
+
+  auto call_src0 = op->args[0].as<CallNode>();
+  auto call_src1 = op->args[1].as<CallNode>();
+  auto call_dst = op->args[2].as<CallNode>();
+  ICHECK(call_src0 && call_src1 && call_dst);
+
+  tvm::tl::RegionOp region_src0(call_src0->args, vmap);
+  tvm::tl::RegionOp region_src1(call_src1->args, vmap);
+  tvm::tl::RegionOp region_dst(call_dst->args, vmap);
+
+  Value src0 = GenExtractSliceFromRegion(region_src0.GetBuffer(), region_src0.GetRanges());
+  Value src1 = GenExtractSliceFromRegion(region_src1.GetBuffer(), region_src1.GetRanges());
+  Array<Range> dst_range = region_dst.GetRanges();
+
+  mlir::Value insertBase = NeedGenInsertSlice(region_dst.GetBuffer(), dst_range, src0);
+  bool needInsertSlice = (insertBase != GetVarValue(call_dst));
+
+  auto src0TensorTy = src0.getType().cast<mlir::TensorType>();
+  auto src0Shape = src0TensorTy.getShape();
+  auto src1TensorTy = src1.getType().cast<mlir::TensorType>();
+  auto src1Shape = src1TensorTy.getShape();
+  auto dstTensorTy = insertBase.getType().cast<mlir::TensorType>();
+  auto dstShape = dstTensorTy.getShape();
+
+  mlir::DenseI64ArrayAttr transpose = builder.getDenseI64ArrayAttr({});
+  ArrayRef<int64_t> shape;
+  if (auto shapedType = insertBase.getType().dyn_cast<ShapedType>()) {
+    shape = shapedType.getShape();
+  }
+  auto dims0 = getBroadcastDim(src0Shape, dstShape);
+  auto brc0 = builder.getDenseI64ArrayAttr(dims0);
+  auto dims1 = getBroadcastDim(src1Shape, dstShape);
+  auto brc1 = builder.getDenseI64ArrayAttr(dims1);
+  llvm::SetVector<int64_t> dims(llvm::from_range_t(), dims0);
+  dims.insert_range(dims1);
+  mlir::DenseI64ArrayAttr broadcast =
+      builder.getDenseI64ArrayAttr(dims.takeVector());
+  src0 = broadcastOrTranspose(src0, insertBase, brc0, transpose, builder);
+  src1 = broadcastOrTranspose(src1, insertBase, brc1, transpose, builder);
+
+  if (src0TensorTy.getElementType().isa<FloatType>() ||
+      src1TensorTy.getElementType().isa<FloatType>()) {
+    LOG(FATAL) << "VfloordivCodegen only supports integer types, but got float type";
+  }
+
+  Value Op = builder.create<mlir::arith::DivSIOp>(loc, src0, src1);
+
+  mlir::Value result = needInsertSlice
+    ? ReshapeCastAndInsertSlice(Op, GetVarValue(call_dst), dst_range)
+    : Op;
+
+  SetVarValue(call_dst, result);
+}
+
 /// Generate hivm.hir.vreduce for tl.npuir_reshape.
 /// before:
 ///    T.npuir_reshape(A, B)
@@ -3811,6 +4098,8 @@ mlir::Value CodeGenTileLangNPUIRDEVA5::VisitExpr_(const CallNode *op) {
     CreateHIVMBinaryVectorOp<ElemwiseOp<linalg::BinaryFn::add>>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_exp"))) {
     UnaryVecOpCodegen<tvm::tl::NpuirExp, ElemwiseOp<linalg::UnaryFn::exp>>(op);
+  } else if (op->op.same_as(Op::Get("tl.npuir_floor"))) {
+    UnaryVecOpCodegen<tvm::tl::NpuirFloor, ElemwiseOp<linalg::UnaryFn::floor>>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_ln"))) {
     UnaryVecOpCodegen<tvm::tl::NpuirLn, ElemwiseOp<linalg::UnaryFn::log>>(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_relu"))) {
@@ -3912,6 +4201,8 @@ mlir::Value CodeGenTileLangNPUIRDEVA5::VisitExpr_(const CallNode *op) {
     VerfCodegen(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_vtanh"))) {
     VtanhCodegen(op);
+  } else if (op->op.same_as(Op::Get("tl.npuir_floordiv"))) {
+    VfloordivCodegen(op);
   } else if (op->op.same_as(Op::Get("tl.npuir_debug_print_var")) ||
              op->op.same_as(Op::Get("tl.npuir_debug_print_buffer_value"))) {
     DebugPrintCodegen(op);

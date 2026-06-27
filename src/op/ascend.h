@@ -125,6 +125,7 @@ NPUIR_BINARY_OP_CLASS(And)
 NPUIR_BINARY_OP_CLASS(Xor)
 NPUIR_BINARY_OP_CLASS(Pow)
 NPUIR_BINARY_OP_CLASS(Shl)
+NPUIR_BINARY_OP_CLASS(FloorDiv)
 
 #define NPUIR_UNARY_OP_CLASS(OPNAME)                                           \
   class Npuir##OPNAME : public Operator {                                      \
@@ -146,6 +147,7 @@ NPUIR_UNARY_OP_CLASS(Rsqrt)
 NPUIR_UNARY_OP_CLASS(Abs)
 NPUIR_UNARY_OP_CLASS(Rec)
 NPUIR_UNARY_OP_CLASS(Not)
+NPUIR_UNARY_OP_CLASS(Floor)
 
 class NpuirDot : public Operator {
 public:
