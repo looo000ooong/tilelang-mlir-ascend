@@ -7,7 +7,6 @@
 #include "codegen_npuir_dev.h"
 #endif
 #ifdef TILELANG_ENABLE_NPUIR_A5
-#include "codegen_npuir_api_a5.h"
 #include "codegen_npuir_dev_a5.h"
 #endif
 
@@ -98,22 +97,6 @@ runtime::Module BuildTileLangNPUIRMLIRDEV(IRModule mod, Target target) {
   return CSourceModuleCreate(mlirCode, "c", function_names);
 }
 #else
-runtime::Module BuildTileLangNPUIRMLIRAPIsA5(IRModule mod, Target target) {
-  using tvm::runtime::Registry;
-  CodeGenTileLangNPUIRAPIA5 cg;
-  Array<String> function_names;
-  for (auto kv : mod->functions) {
-    ICHECK(kv.second->IsInstance<PrimFuncNode>())
-        << "CodeGenTileLangNPUIRAPIA5: Can only take PrimFunc";
-    auto gvar = Downcast<GlobalVar>(kv.first);
-    auto f = Downcast<PrimFunc>(kv.second);
-    cg.AddFunction(gvar, f);
-    function_names.push_back(cg.GetCurrentFunctionName());
-  }
-  std::string mlirCode = cg.Finish();
-  return CSourceModuleCreate(mlirCode, "c", function_names);
-}
-
 /**
  * @brief Builds a runtime module containing TileLang NPU IR MLIR code for
  * Developer mode.
@@ -162,13 +145,6 @@ TVM_REGISTER_GLOBAL("target.build.tilelang_npuir_dev")
 #endif
 
 #ifdef TILELANG_ENABLE_NPUIR_A5
-TVM_REGISTER_GLOBAL("target.build.tilelang_npuir_apis_a5")
-    .set_body_typed(BuildTileLangNPUIRMLIRAPIsA5);
-TVM_REGISTER_GLOBAL("target.build.tilelang_npuir_apis")
-    .set_body_typed(BuildTileLangNPUIRMLIRAPIsA5);
-
-TVM_REGISTER_GLOBAL("target.build.tilelang_npuir_dev_a5")
-    .set_body_typed(BuildTileLangNPUIRMLIRDEVA5);
 TVM_REGISTER_GLOBAL("target.build.tilelang_npuir_dev")
     .set_body_typed(BuildTileLangNPUIRMLIRDEVA5);
 #endif

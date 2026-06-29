@@ -154,7 +154,7 @@ bool MatchStoreBody(const Stmt &stmt, const Var &loop_var,
   }
 
   if (src_load->indices.size() == 1U) {
-    // 1D 原始模式： O_UB[i] = X[IDX_UB[i]]
+    // 1D pattern: O_UB[i] = X[IDX_UB[i]]
     const auto *idx_load = src_load->indices[0].as<BufferLoadNode>();
     if (!idx_load || idx_load->indices.size() != 1U) {
       return false;
