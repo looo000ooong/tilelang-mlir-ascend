@@ -1492,33 +1492,41 @@ class compiler_npu:
             # TileLang Ascend JIT Runtime now follows Triton JIT style.
             # bishengir-compile --enable-triton-kernel-compile=true make sure the way.
 
-            # Build compile options with pass_configs support
             _compile_option_list = []
-
-            # Get configuration from pass_configs with default values
             pass_configs = getattr(self, "pass_configs", {})
 
-            # Handle --enable-auto-multi-buffer option
-            enable_auto_multi_buffer = pass_configs.get(
-                "npuir.enable_auto_multi_buffer",
-                True,  # Default: enabled
-            )
-            _compile_option_list.append(
-                f"--enable-auto-multi-buffer={str(enable_auto_multi_buffer).lower()}"
-            )
-
-            # Handle --disable-hivm-auto-inject-sync option
-            disable_hivm_auto_inject_sync = pass_configs.get(
-                "npuir.disable_hivm_auto_inject_sync",
-                False,  # Default: enabled
-            )
-            _compile_option_list.append(
-                f"--disable-hivm-auto-inject-sync={str(disable_hivm_auto_inject_sync).lower()}"
-            )
-
-            _compile_option_list.append("--enable-triton-kernel-compile=true")
-
-            _compile_option_list.append("--enable-hivm-compile=true")
+            if _is_a5_device():
+                # === A5 compile options ===
+                env_arch = os.getenv("TRITON_ASCEND_ARCH", "")
+                target_arch = env_arch if env_arch else _ARCH_CACHE
+                _compile_option_list = [
+                    f"--target={target_arch}",
+                    "--enable-auto-multi-buffer=true",
+                    "--disable-ffts",
+                    "--enable-triton-kernel-compile=true",
+                    "--enable-hivm-compile=true",
+                    "--enable-vf-merge-level=1",
+                    "--enable-hfusion-compile=true",
+                    "--enable-auto-bind-sub-block=true",
+                ]
+            else:
+                # === Non-A5 compile options ===
+                enable_auto_multi_buffer = pass_configs.get(
+                    "npuir.enable_auto_multi_buffer",
+                    True,
+                )
+                _compile_option_list.append(
+                    f"--enable-auto-multi-buffer={str(enable_auto_multi_buffer).lower()}"
+                )
+                disable_hivm_auto_inject_sync = pass_configs.get(
+                    "npuir.disable_hivm_auto_inject_sync",
+                    False,
+                )
+                _compile_option_list.append(
+                    f"--disable-hivm-auto-inject-sync={str(disable_hivm_auto_inject_sync).lower()}"
+                )
+                _compile_option_list.append("--enable-triton-kernel-compile=true")
+                _compile_option_list.append("--enable-hivm-compile=true")
 
             TILELANG_ASCEND_MODE = os.environ.get("TILELANG_ASCEND_MODE")
             if TILELANG_ASCEND_MODE is None or TILELANG_ASCEND_MODE.lower().strip() in [
