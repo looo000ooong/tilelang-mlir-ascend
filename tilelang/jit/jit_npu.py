@@ -285,8 +285,17 @@ def extract_device_print_code_from_cann():
 
 
 def generate_npu_wrapper_src(
-    constants, signature, workspace_size, mix_mode, lock_num, lock_ini_val, need_debug,
-    force_simt_only=False, shared_mem_dynamic_size=0, compile_on_910_95=False, target_support_ffts=True
+    constants,
+    signature,
+    workspace_size,
+    mix_mode,
+    lock_num,
+    lock_ini_val,
+    need_debug,
+    force_simt_only=False,
+    shared_mem_dynamic_size=0,
+    compile_on_910_95=False,
+    target_support_ffts=True,
 ):
     def _ty_to_cpp(ty):
         if ty[0] == "*":
@@ -556,7 +565,11 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
   std::string name = "";
   name.append(kernelName);
   void *workspace_addr = NULL;
-  {'auto launch_call = [=]() -> rtError_t' if (enable_taskqueue and compile_on_910_95) else ("auto launch_call = [&]()" if enable_taskqueue else "")} {{
+  {
+        "auto launch_call = [=]() -> rtError_t"
+        if (enable_taskqueue and compile_on_910_95)
+        else ("auto launch_call = [&]()" if enable_taskqueue else "")
+    } {{
     uint32_t blockNum = gridX * gridY * gridZ;
     {
         "blockNum = std::min(blockNum, (uint32_t)" + str(num_physical_blocks) + ");"
@@ -614,35 +627,89 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
         else ""
     }
     struct __attribute__((packed)) {{
-      {'void* ffts_addr __attribute__((aligned(8)));' if target_support_ffts else ''}
-      {'void* syncBlockLock __attribute__((aligned(8)));' if not force_simt_only else ''}
-      {'void* workspace_addr __attribute__((aligned(8)));' if not force_simt_only else ''}
-      {' '.join(f'{_ty_to_cpp(ty)} arg{i} __attribute__((aligned({4 if ty[0] != "*" and ty[-2:] != "64" else 8})));' for i, ty in signature.items() if i not in constants)}
-      {' '.join(f'{_ty_to_cpp(ty)} grid{mark} __attribute__((aligned(4)));' for mark, ty in grid_info.items())}
+      {"void* ffts_addr __attribute__((aligned(8)));" if target_support_ffts else ""}
+      {
+        "void* syncBlockLock __attribute__((aligned(8)));"
+        if not force_simt_only
+        else ""
+    }
+      {
+        "void* workspace_addr __attribute__((aligned(8)));"
+        if not force_simt_only
+        else ""
+    }
+      {
+        " ".join(
+            f"{_ty_to_cpp(ty)} arg{i} __attribute__((aligned({4 if ty[0] != "*" and ty[-2:] != "64" else 8})));"
+            for i, ty in signature.items()
+            if i not in constants
+        )
+    }
+      {
+        " ".join(
+            f"{_ty_to_cpp(ty)} grid{mark} __attribute__((aligned(4)));"
+            for mark, ty in grid_info.items()
+        )
+    }
       {"void* DTData __attribute__((aligned(8)));" if need_debug else ""}
     }} args = {{
-      {'static_cast<void*>(ffts_addr),' if target_support_ffts else ''}
-      {('static_cast<void*>(syncBlockLock),' if lock_num > 0 else 'nullptr,') if not force_simt_only else ''}
-      {('static_cast<void*>(workspace_addr),' if workspace_size > 0 else 'nullptr,') if not force_simt_only else ''}
-      {', '.join(f'static_cast<{_ty_to_cpp(ty)}>(arg{i})' for i, ty in signature.items() if i not in constants)},
-      {', '.join(f'static_cast<{_ty_to_cpp(ty)}>(grid{mark})' for mark, ty in grid_info.items())}
+      {"static_cast<void*>(ffts_addr)," if target_support_ffts else ""}
+      {
+        ("static_cast<void*>(syncBlockLock)," if lock_num > 0 else "nullptr,")
+        if not force_simt_only
+        else ""
+    }
+      {
+        ("static_cast<void*>(workspace_addr)," if workspace_size > 0 else "nullptr,")
+        if not force_simt_only
+        else ""
+    }
+      {
+        ", ".join(
+            f"static_cast<{_ty_to_cpp(ty)}>(arg{i})"
+            for i, ty in signature.items()
+            if i not in constants
+        )
+    },
+      {
+        ", ".join(
+            f"static_cast<{_ty_to_cpp(ty)}>(grid{mark})"
+            for mark, ty in grid_info.items()
+        )
+    }
       {", static_cast<void*>(DTData)" if need_debug else ""}
     }};
     {cpp_msprof_call_before_launch}
-    {f'''
+    {
+        f'''
     rtArgsEx_t argsInfo = {{}};
     argsInfo.args = static_cast<void*>(&args);
     argsInfo.argsSize = sizeof(args);
     rtTaskCfgInfo_t cfgInfo = {{}};
     cfgInfo.localMemorySize = {shared_mem_dynamic_size};
     ret = rtKernelLaunchWithFlagV2(func, blockNum, &argsInfo, NULL, stream, 0, &cfgInfo);
-    ''' if compile_on_910_95 else 'ret = rtKernelLaunch(func, blockNum, static_cast<void*>(&args), sizeof(args), NULL, stream);'}
+    '''
+        if compile_on_910_95
+        else "ret = rtKernelLaunch(func, blockNum, static_cast<void*>(&args), sizeof(args), NULL, stream);"
+    }
     {"void *&stream_ref = const_cast<void*&>(stream);" if need_debug else ""}
     {"cce::internal::DebugTunnel::Close(DTData, stream_ref);" if need_debug else ""}
     {cpp_msprof_call_after_launch}
-    {'return ret;' if enable_taskqueue else ('ret = rtStreamSynchronize(stream);' if compile_on_910_95 else '')}
+    {
+        "return ret;"
+        if enable_taskqueue
+        else ("ret = rtStreamSynchronize(stream);" if compile_on_910_95 else "")
+    }
    }};
-   {'at_npu::native::OpCommand cmd; cmd.Name(name.c_str()).SetCustomHandler(launch_call).Run();' if (enable_taskqueue and compile_on_910_95) else ('at_npu::native::OpCommand::RunOpApi(name.c_str(), launch_call, true); rtFree(workspace_addr);' if enable_taskqueue else '')}
+   {
+        "at_npu::native::OpCommand cmd; cmd.Name(name.c_str()).SetCustomHandler(launch_call).Run();"
+        if (enable_taskqueue and compile_on_910_95)
+        else (
+            "at_npu::native::OpCommand::RunOpApi(name.c_str(), launch_call, true); rtFree(workspace_addr);"
+            if enable_taskqueue
+            else ""
+        )
+    }
   return;
 }}
 
@@ -862,8 +929,7 @@ class JitKernel_NPU:
         self.symbolic = metadata["symbolic"]
         self.prim_func = metadata["primfunc"]
         self.out_idx = _normalize_out_idx(
-            out_idx if out_idx is not None else metadata["out_idx"],
-            len(self.params)
+            out_idx if out_idx is not None else metadata["out_idx"], len(self.params)
         )
         self._launch()
         (
@@ -1213,7 +1279,9 @@ class compiler_npu:
         self.metadata["kernel_src"] = self._npuir_to_bin_enable_npu_compile()
         self.header_path = get_npu_launcher_header()
         is_a5 = _is_a5_device()
-        shared_mem_dynamic_size = self.metadata.get("shared_mem_dynamic_size", 221184 if is_a5 else 0)
+        shared_mem_dynamic_size = self.metadata.get(
+            "shared_mem_dynamic_size", 221184 if is_a5 else 0
+        )
         self.wrapper_src = generate_npu_wrapper_src(
             self.constants,
             self.signature,

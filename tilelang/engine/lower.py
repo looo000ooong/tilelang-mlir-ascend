@@ -280,6 +280,7 @@ def lower(
             print(mlir_str)
         # A5: tilelangir native module not available, skip MLIR pass pipeline
         from tilelang.jit.jit_npu import _is_a5_device
+
         if not _is_a5_device():
             pipeline = Pipeline()
             pipeline.add(transforms.mlir.canonicalize, top_down=True)

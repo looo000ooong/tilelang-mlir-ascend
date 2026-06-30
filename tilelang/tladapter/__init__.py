@@ -9,6 +9,7 @@ from tilelang import libinfo
 
 _native = None
 
+
 def _load_tilelangir_passes_so():
     global _native
     try:
@@ -19,6 +20,7 @@ def _load_tilelangir_passes_so():
         ctypes.CDLL(path)
         import importlib.util
         from importlib.machinery import ExtensionFileLoader
+
         mod_name = "tilelangir"
         loader = ExtensionFileLoader(mod_name, path)
         spec = importlib.util.spec_from_loader(mod_name, loader)
@@ -39,6 +41,7 @@ def _load_tilelangir_passes_so():
 _load_tilelangir_passes_so()
 
 import importlib
+
 utils = importlib.import_module("tilelang.tladapter.utils")
 transforms = importlib.import_module("tilelang.tladapter.transforms")
 conversion = importlib.import_module("tilelang.tladapter.conversion")

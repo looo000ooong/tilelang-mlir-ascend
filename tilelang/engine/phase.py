@@ -25,7 +25,8 @@ def _parse_bool_env(name: str, default: bool) -> bool:
         return False
     valid_values = sorted(_TRUE_ENV_VALUES | _FALSE_ENV_VALUES)
     raise ValueError(
-        f"Invalid {name}={value!r}. Expected one of: {', '.join(valid_values)}.")
+        f"Invalid {name}={value!r}. Expected one of: {', '.join(valid_values)}."
+    )
 
 
 def enable_npuir_simt() -> bool:
@@ -137,6 +138,7 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     elif target.kind.name == "npuir":
         # A5 SIMT indirect load must run before NpuLoopVectorize
         from tilelang.jit.jit_npu import _is_a5_device
+
         if _is_a5_device() and enable_npuir_simt():
             mod = tilelang.transform.NpuSimtIndirectLoad()(mod)
         # The position of NpuLoopVectorize pass has two requirements:
