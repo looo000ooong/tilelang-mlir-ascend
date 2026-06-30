@@ -152,7 +152,12 @@ class KernelCache:
         JitKernel_NPU
             A compiled, ready-to-run NPU kernel wrapper.
         """
-        from tilelang.jit.jit_npu import compiler_npu
+        from tilelang.jit.jit_npu import compiler_npu, _normalize_out_idx
+
+        # Normalize out_idx at cache boundary so that cache key, compile path,
+        # and pickled metadata all use the same canonical form
+        if out_idx is not None:
+            out_idx = _normalize_out_idx(out_idx, len(func.params))
 
         _key = self._generate_compile_key(
             func=func,

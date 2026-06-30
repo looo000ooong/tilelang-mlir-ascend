@@ -27,6 +27,38 @@ from tilelang.profiler import Profiler, TensorSupplyType
 from tilelang.transform.pass_config import normalize_pass_configs
 
 
+_ARCH_CACHE = None
+
+
+def _is_a5_device():
+    global _ARCH_CACHE
+    if _ARCH_CACHE is None:
+        _ARCH_CACHE = NPUUtils().get_arch()
+    return "910_95" in _ARCH_CACHE or "950" in _ARCH_CACHE
+
+
+def _normalize_out_idx(out_idx, total_params):
+    if out_idx is None:
+        return None
+    if isinstance(out_idx, int):
+        out_idx = [out_idx]
+    elif isinstance(out_idx, (list, tuple)):
+        out_idx = list(out_idx)
+    else:
+        raise TypeError(
+            f"out_idx must be int, list, or tuple; got {type(out_idx).__name__}"
+        )
+    normalized = []
+    for i in out_idx:
+        idx = i if i >= 0 else total_params + i
+        if idx < 0 or idx >= total_params:
+            raise ValueError(
+                f"out_idx {i} is out of bounds for kernel with {total_params} parameters"
+            )
+        normalized.append(idx)
+    return normalized
+
+
 class LaunchThreadExtractor:
     def __init__(self) -> None:
         self.expressions = []
@@ -813,7 +845,6 @@ class JitKernel_NPU:
     def __init__(self, metadata: dict, out_idx=None) -> None:
         self.params = metadata["params"]
         self.signature = metadata.get("signature", {})
-        self.out_idx = out_idx
         self.param_info = metadata.get("param_info", [])
         # 1 launch path
         self.so_launcher_path = metadata.get(
@@ -844,7 +875,10 @@ class JitKernel_NPU:
         self.gridfunc = metadata["gridfunc"]
         self.symbolic = metadata["symbolic"]
         self.prim_func = metadata["primfunc"]
-        self.out_idx = metadata["out_idx"]
+        self.out_idx = _normalize_out_idx(
+            out_idx if out_idx is not None else metadata["out_idx"],
+            len(self.params)
+        )
         self._launch()
         (
             self.npu_module,
@@ -869,10 +903,7 @@ class JitKernel_NPU:
         metadata: str,
         out_idx: Union[List[int], int],
     ):
-        if isinstance(out_idx, int):
-            out_idx = [out_idx]
         metadata["so_launcher_path"] = kernel_launcher_path
-        metadata["out_idx"] = out_idx
         instance = cls(metadata)
         instance.so_launcher_path = kernel_launcher_path
         instance.so_utils_path = kernel_utils_path
@@ -1158,10 +1189,8 @@ class compiler_npu:
         self.original_mod = mod
         # extract_param_info
         param_info = self._extract_param_info(mod, out_idx)
-        # process negative out_idx
-        if out_idx is not None:
-            total_params = len(param_info)
-            out_idx = [i if i >= 0 else total_params + i for i in out_idx]
+        # Normalise out_idx to canonical (non-negative, list) form
+        out_idx = _normalize_out_idx(out_idx, len(param_info))
         self.metadata = {}
         self.metadata["out_idx"] = out_idx
         self.metadata["param_info"] = param_info
@@ -1414,8 +1443,12 @@ class compiler_npu:
         result = {}
         index = 0
 
-        # Skip parameters insert by compiler
-        for param in params[3:-6]:
+        # Skip parameters inserted by compiler:
+        # A5 (910_95/950): 2 params (syncBlockLock, workspace) - ffts_addr not supported
+        # Others: 3 params (ffts_addr, syncBlockLock, workspace)
+        is_a5 = _is_a5_device()
+        compiler_inserted_params = 2 if is_a5 else 3
+        for param in params[compiler_inserted_params:-6]:
             # Check if the type includes the target type
             found_type = None
             for t_type in target_types:
