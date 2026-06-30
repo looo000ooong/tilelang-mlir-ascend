@@ -278,15 +278,18 @@ def lower(
         if dump_ir:
             print("====== npuir ======")
             print(mlir_str)
-        pipeline = Pipeline()
-        pipeline.add(transforms.mlir.canonicalize, top_down=True)
-        pipeline.add(transforms.bishengir.adapt_triton_kernel)
-        if dump_ir:
-            pipeline.enable_ir_printing()
-        mlir_str = pipeline.run(mlir_str)
-        if dump_ir:
-            print("====== final npuir ======")
-            print(mlir_str)
+        # A5: tilelangir native module not available, skip MLIR pass pipeline
+        from tilelang.jit.jit_npu import _is_a5_device
+        if not _is_a5_device():
+            pipeline = Pipeline()
+            pipeline.add(transforms.mlir.canonicalize, top_down=True)
+            pipeline.add(transforms.bishengir.adapt_triton_kernel)
+            if dump_ir:
+                pipeline.enable_ir_printing()
+            mlir_str = pipeline.run(mlir_str)
+            if dump_ir:
+                print("====== final npuir ======")
+                print(mlir_str)
         return mlir_str
 
     host_mod = tir.transform.Filter(_is_host_call)(mod)
