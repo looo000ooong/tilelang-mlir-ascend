@@ -13,6 +13,6 @@ from . import mlir, bishengir
 try:
     from . import tilelangir
 except ImportError:
-    tilelangir = None  # graceful degradation on platforms without tilelangir
+    tilelangir = None
 
 __all__ = ["mlir", "bishengir"]

@@ -566,7 +566,7 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
   name.append(kernelName);
   void *workspace_addr = NULL;
   {
-        "auto launch_call = [=]() -> rtError_t"
+        "auto launch_call = [=]() mutable -> rtError_t"
         if (enable_taskqueue and compile_on_910_95)
         else ("auto launch_call = [&]()" if enable_taskqueue else "")
     } {{

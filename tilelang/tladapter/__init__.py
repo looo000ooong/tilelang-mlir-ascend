@@ -35,7 +35,7 @@ def _load_tilelangir_passes_so():
         _native = _native_mod
         sys.modules[__name__]._native = _native_mod
     except Exception:
-        pass  # graceful degradation on platforms without tilelangir
+        pass
 
 
 _load_tilelangir_passes_so()

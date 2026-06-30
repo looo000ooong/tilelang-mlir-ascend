@@ -30,7 +30,7 @@ def _parse_bool_env(name: str, default: bool) -> bool:
 
 
 def enable_npuir_simt() -> bool:
-    return _parse_bool_env(ENABLE_SIMT_ENV, default=True)
+    return _parse_bool_env(ENABLE_SIMT_ENV, default=False)
 
 
 def allow_warp_specialized(
