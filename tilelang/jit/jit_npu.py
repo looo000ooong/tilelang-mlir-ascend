@@ -640,7 +640,7 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
     }
       {
         " ".join(
-            f"{_ty_to_cpp(ty)} arg{i} __attribute__((aligned({4 if ty[0] != "*" and ty[-2:] != "64" else 8})));"
+            f"{_ty_to_cpp(ty)} arg{i} __attribute__((aligned({4 if ty[0] != '*' and ty[-2:] != '64' else 8})));"
             for i, ty in signature.items()
             if i not in constants
         )
