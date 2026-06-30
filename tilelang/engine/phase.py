@@ -1,5 +1,6 @@
 # Copyright (c) Tile-AI Organization.
 # Licensed under the MIT License.
+import os
 from tvm import tir, IRModule
 from tvm.target import Target
 import tilelang
@@ -7,6 +8,28 @@ from tilelang.transform import PassContext
 from tilelang.contrib.nvcc import have_tma
 from typing import Optional
 from tilelang.utils import get_ascend_device_name, supports_native_bf16
+
+ENABLE_SIMT_ENV = "TILELANG_ENABLE_SIMT"
+_TRUE_ENV_VALUES = {"1", "true", "t", "yes", "y", "on"}
+_FALSE_ENV_VALUES = {"0", "false", "f", "no", "n", "off"}
+
+
+def _parse_bool_env(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in _TRUE_ENV_VALUES:
+        return True
+    if normalized in _FALSE_ENV_VALUES:
+        return False
+    valid_values = sorted(_TRUE_ENV_VALUES | _FALSE_ENV_VALUES)
+    raise ValueError(
+        f"Invalid {name}={value!r}. Expected one of: {', '.join(valid_values)}.")
+
+
+def enable_npuir_simt() -> bool:
+    return _parse_bool_env(ENABLE_SIMT_ENV, default=True)
 
 
 def allow_warp_specialized(
@@ -112,6 +135,10 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
         mod = tilelang.transform.RewriteWgmmaSync()(mod)
         mod = tilelang.transform.InjectFenceProxy()(mod)
     elif target.kind.name == "npuir":
+        # A5 SIMT indirect load must run before NpuLoopVectorize
+        from tilelang.jit.jit_npu import _is_a5_device
+        if _is_a5_device() and enable_npuir_simt():
+            mod = tilelang.transform.NpuSimtIndirectLoad()(mod)
         # The position of NpuLoopVectorize pass has two requirements:
         # 1. must be before LowerOpaqueBlock pass, otherwise the temporary buffer created cannot correctly become T.decl_buffer
         # 2. better to be before PlanAndUpdateBufferAllocationLocation, reuse its ability of Memory reusing
