@@ -155,6 +155,8 @@ private:
   Array<String> GenConvertIndex(Array<PrimExpr> exprs);
   String GenSubviewFromRegion(const CallNode *region_node);
   String GenSubviewFromRegion(Buffer buffer_data, Array<Range> range);
+  String GenRankReducedSubviewFromRegion(Buffer buffer_data,
+                                         Array<Range> range, int min_rank);
   void GenRecastFromArg(Buffer curr_buffer, String arg_name,
                         String &recast_inst);
   String GetMemrefInfo(String name);

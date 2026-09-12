@@ -132,6 +132,11 @@ std::vector<unsigned long> GetStrideFromShape(Array<tvm::PrimExpr> shape) {
     if (auto s_int = as_const_int(s)) {
       total_size *= *s_int;
       shape_int.push_back(*s_int);
+    } else {
+      // A runtime dimension has no compile-time stride.  Callers that need a
+      // dynamic layout must retain the symbolic stride expression instead of
+      // indexing the incomplete `shape_int` vector below.
+      return {};
     }
   }
   for (int i = 0; i < shape.size(); i++) {
@@ -160,7 +165,7 @@ String GetBufferStrides(Buffer buffer) {
   for (int i = 0; i < dim; i++) {
     if (i > 0)
       res = res + ", ";
-    res = res + std::to_string(strides[i]);
+    res = res + (i < strides.size() ? std::to_string(strides[i]) : "?");
   }
   res = res + "]";
   return res;
@@ -667,6 +672,115 @@ String CodeGenTileLangNPUIR::GenSubviewFromRegion(Buffer buffer_data,
   return new_buffer_name;
 }
 
+String CodeGenTileLangNPUIR::GenRankReducedSubviewFromRegion(
+    Buffer buffer_data, Array<Range> range, int min_rank) {
+  ICHECK(!range.empty())
+      << "GenRankReducedSubviewFromRegion requires a non-scalar region.";
+
+  Array<PrimExpr> region_shape, region_indices;
+  for (const Range &r : range) {
+    region_shape.push_back(r->extent);
+    region_indices.push_back(r->min);
+  }
+
+  // Mirror codegen_npuir_api.cc::GenRankReducedSubviewFromRegion:
+  //   drop leading static-1 dims first, keep trailing 1s so the projected
+  //   rank matches `min_rank` (used by 2D Cube ops such as nd2nz/fixpipe).
+  const int num_non_static_1 = std::count_if(
+      region_shape.begin(), region_shape.end(), [](const PrimExpr &extent) {
+        const int64_t *value = as_const_int(extent);
+        return value == nullptr || *value != 1;
+      });
+  const int total_static_1 =
+      static_cast<int>(region_shape.size()) - num_non_static_1;
+  const int static_1_to_keep = std::max(0, min_rank - num_non_static_1);
+  const int static_1_to_drop = std::max(0, total_static_1 - static_1_to_keep);
+
+  String buffer_name = buffer_data->name;
+  String base_name = buffer_name;
+  auto *base_memref = dynamic_cast<Memref *>(type_info[buffer_name]);
+  ICHECK(base_memref) << buffer_name << " should be a memref";
+  if (base_memref->is_arg) {
+    base_name = buffer_name + "_Recast";
+    base_memref = dynamic_cast<Memref *>(type_info[base_name]);
+    ICHECK(base_memref) << base_name << " should be a memref";
+  }
+
+  Array<PrimExpr> reduced_shape;
+  Array<PrimExpr> reduced_strides;
+  std::vector<size_t> kept_dims;
+  int static_1_dropped = 0;
+  for (size_t i = 0; i < region_shape.size(); ++i) {
+    const int64_t *value = as_const_int(region_shape[i]);
+    if (value != nullptr && *value == 1) {
+      if (static_1_dropped < static_1_to_drop) {
+        ++static_1_dropped;
+        continue;
+      }
+      reduced_shape.push_back(region_shape[i]);
+      reduced_strides.push_back(base_memref->stride[i]);
+      kept_dims.push_back(i);
+      continue;
+    }
+    reduced_shape.push_back(region_shape[i]);
+    reduced_strides.push_back(base_memref->stride[i]);
+    kept_dims.push_back(i);
+  }
+  if (reduced_shape.empty()) {
+    reduced_shape.push_back(region_shape.back());
+    reduced_strides.push_back(base_memref->stride.back());
+    kept_dims.push_back(region_shape.size() - 1);
+  }
+
+  // Fast path: only reuse the original memref when no rank reduction is needed
+  // AND the region covers the whole buffer.  For full-region slices like
+  // [1, 1, 32] we must still build a rank-reduced subview (e.g. 1x32) so Cube
+  // nd2nz/fixpipe keep the expected operand rank.
+  if (static_1_to_drop == 0 &&
+      IsEqual(buffer_data->shape, region_shape) && AllZero(region_indices)) {
+    return base_name;
+  }
+
+  // MLIR memref.subview semantics: offsets/sizes/strides counts must equal
+  // the source memref rank, while the result type may be rank-reduced.
+  // Reference: codegen_npuir_api.cc builds SubViewOp with full-rank operand
+  // arrays but a reduced result type (keptDims projection).
+  Array<String> offsets = GenConvertIndex(region_indices);
+  Array<String> sizes = GenConvertIndex(region_shape);
+  const unsigned long offset = ComputeOffset(base_memref, region_indices);
+  const String new_name = base_name + "_rank_reduced";
+  auto *result_memref = new Memref(
+      new_name, reduced_shape, buffer_data->dtype, base_memref->address_space,
+      offset == static_cast<unsigned long>(-1), reduced_strides, offset);
+  const String src_type = GetMemrefInfo(base_name);
+  const String dst_type = GetMemrefInfo(result_memref);
+
+  std::ostringstream inst;
+  inst << "memref.subview %" << base_name << "[";
+  for (int i = 0; i < static_cast<int>(offsets.size()); ++i) {
+    if (i != 0)
+      inst << ", ";
+    inst << offsets[i];
+  }
+  inst << "] [";
+  for (int i = 0; i < static_cast<int>(sizes.size()); ++i) {
+    if (i != 0)
+      inst << ", ";
+    inst << sizes[i];
+  }
+  inst << "] [";
+  for (int i = 0; i < static_cast<int>(range.size()); ++i) {
+    if (i != 0)
+      inst << ", ";
+    inst << "1";
+  }
+  inst << "] : " << src_type << " to " << dst_type;
+
+  String ssa_name = SSAGetID(inst.str(), buffer_data->dtype);
+  type_info[ssa_name] = result_memref;
+  return ssa_name;
+}
+
 /// Generate hivm.hir.load or hivm.hir.store for tl.ascend_copy.
 /// before:
 ///   T.ascend_copy(T.region(A[bx, by], 1, 128, 256), T.region(A_VEC[0, 0],
@@ -677,37 +791,55 @@ String CodeGenTileLangNPUIR::GenSubviewFromRegion(Buffer buffer_data,
 void CodeGenTileLangNPUIR::AscendCopyCodegen(const CallNode *op,
                                              std::ostream &os) {
   tvm::tl::AscendCopy npuirop(op->args, this->vmap);
-  // gen memref.subview
-  String src_data_name = GenSubviewFromRegion(npuirop.src, npuirop.src_range);
-  String dst_data_name = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
+  const String src_scope = GetPtrStorageScope(npuirop.src->data);
+  const String dst_scope = GetPtrStorageScope(npuirop.dst->data);
+  String src_data_name;
+  String dst_data_name;
 
-  // gen hivm.ir.load / hivm.ir.store
+  if (src_scope == "global" && dst_scope == "shared.dyn") {
+    src_data_name =
+        GenRankReducedSubviewFromRegion(npuirop.src, npuirop.src_range, 2);
+    dst_data_name =
+        GenRankReducedSubviewFromRegion(npuirop.dst, npuirop.dst_range, 2);
+    this->PrintIndent();
+    this->stream << "hivm.hir.nd2nz {dst_continuous} ins(%"
+                 << src_data_name << " : " << GetMemrefInfo(src_data_name)
+                 << ") outs(%" << dst_data_name << " : "
+                 << GetMemrefInfo(dst_data_name) << ") init_out_buffer = false\n";
+    return;
+  }
+  if (src_scope == "wmma.accumulator" && dst_scope == "global") {
+    src_data_name =
+        GenRankReducedSubviewFromRegion(npuirop.src, npuirop.src_range, 2);
+    dst_data_name =
+        GenRankReducedSubviewFromRegion(npuirop.dst, npuirop.dst_range, 2);
+    this->PrintIndent();
+    this->stream << "hivm.hir.fixpipe {enable_nz2nd} ins(%"
+                 << src_data_name << " : " << GetMemrefInfo(src_data_name)
+                 << ") outs(%" << dst_data_name << " : "
+                 << GetMemrefInfo(dst_data_name) << ")\n";
+    return;
+  }
+
+  auto non_singleton_rank = [](const Array<Range> &ranges) {
+    return std::count_if(ranges.begin(), ranges.end(), [](const Range &range) {
+      const int64_t *value = as_const_int(range->extent);
+      return value == nullptr || *value != 1;
+    });
+  };
+  const int min_rank =
+      std::max(non_singleton_rank(npuirop.src_range),
+               non_singleton_rank(npuirop.dst_range));
+  src_data_name = GenRankReducedSubviewFromRegion(npuirop.src,
+                                                   npuirop.src_range, min_rank);
+  dst_data_name = GenRankReducedSubviewFromRegion(npuirop.dst,
+                                                   npuirop.dst_range, min_rank);
+  ICHECK(npuirop.src->dtype == npuirop.dst->dtype)
+      << "T.copy does not support element type conversion.";
   this->PrintIndent();
-  if (!dynamic_cast<Memref *>(type_info[src_data_name])) {
-    LOG(FATAL) << src_data_name << " should be a memref";
-  }
-  if (!dynamic_cast<Memref *>(type_info[dst_data_name])) {
-    LOG(FATAL) << dst_data_name << " should be a memref";
-  }
-  if (dynamic_cast<Memref *>(type_info[src_data_name])->address_space == "gm") {
-    this->stream << "hivm.hir.load";
-  } else if (dynamic_cast<Memref *>(type_info[dst_data_name])->address_space ==
-             "gm") {
-    this->stream << "hivm.hir.store";
-  } else if (dynamic_cast<Memref *>(type_info[src_data_name])->address_space ==
-                 "ub" &&
-             dynamic_cast<Memref *>(type_info[dst_data_name])->address_space ==
-                 "ub") {
-    this->stream << "hivm.hir.copy";
-  }
-  this->stream << " ins(" << "\%" << src_data_name << " : "
-               << GetMemrefInfo(src_data_name) << ")";
-  this->stream << " outs(" << "\%" << dst_data_name << " : "
-               << GetMemrefInfo(dst_data_name) << ")";
-  // TODO: error: custom op 'init_out_buffer' is unknown
-  // this->stream << " left_padding_num = %c0 : index init_out_buffer =
-  // false";
-  this->stream << "\n";
+  this->stream << "memref.copy %" << src_data_name << ", %" << dst_data_name
+               << " : " << GetMemrefInfo(src_data_name) << " to "
+               << GetMemrefInfo(dst_data_name) << "\n";
 }
 
 template <typename T>
@@ -911,8 +1043,13 @@ void CodeGenTileLangNPUIR::Nd2NzCodegen(const CallNode *op, std::ostream &os) {
   // Generate hivm.hir.nd2nz for tl.npuir_load_nd2nz.
   tvm::tl::NpuirNd2nz npuirop(op->args, this->vmap);
   // gen memref.subview
-  String src_data_name = GenSubviewFromRegion(npuirop.src, npuirop.src_range);
-  String dst_data_name = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
+  // src is GM: ensure min_rank=2 to maintain consistent GM rank across all
+  // nd2nz calls in the same function, preventing callee signature mismatches.
+  String src_data_name = GenRankReducedSubviewFromRegion(npuirop.src,
+                                                          npuirop.src_range, 2);
+  // dst is cbuf: downstream will cast to 4D, so no min_rank needed.
+  String dst_data_name = GenRankReducedSubviewFromRegion(npuirop.dst,
+                                                          npuirop.dst_range, 0);
   bool dst_continuous = npuirop.dst_continuous;
 
   // gen hivm.hir.nd2nz
@@ -924,6 +1061,7 @@ void CodeGenTileLangNPUIR::Nd2NzCodegen(const CallNode *op, std::ostream &os) {
                << GetMemrefInfo(src_data_name) << ")";
   this->stream << " outs(%" << dst_data_name << " : "
                << GetMemrefInfo(dst_data_name) << ")";
+  this->stream << " init_out_buffer = false";
   this->stream << "\n";
 }
 
@@ -932,11 +1070,14 @@ void CodeGenTileLangNPUIR::FixpipeCodegen(const CallNode *op,
   // Generate hivm.hir.fixpipe for tl.npuir_store_fixpipe.
   tvm::tl::NpuirFixpipe npuirop(op->args, this->vmap);
   // gen memref.subview
-  String src_data_name = GenSubviewFromRegion(npuirop.src, npuirop.src_range);
-  String dst_data_name = GenSubviewFromRegion(npuirop.dst, npuirop.dst_range);
+  // src is cc: no min_rank needed.
+  String src_data_name = GenRankReducedSubviewFromRegion(npuirop.src,
+                                                          npuirop.src_range, 0);
+  // dst is GM: ensure min_rank=2 to maintain consistent GM rank across all
+  // fixpipe calls in the same function, preventing callee signature mismatches.
+  String dst_data_name = GenRankReducedSubviewFromRegion(npuirop.dst,
+                                                          npuirop.dst_range, 2);
   bool enable_nz2nd = npuirop.enable_nz2nd;
-  bool channel_split = npuirop.channel_split;
-  int pre_relu_mode = npuirop.pre_relu_mode;
 
   // gen hivm.hir.fixpipe
   this->PrintIndent();
@@ -958,14 +1099,22 @@ void CodeGenTileLangNPUIR::FixpipeCodegen(const CallNode *op,
     }
   }
 
+  // Mirror API mode attribute printing: only emit non-default values.
+  //   enable_nz2nd: UnitAttr, only present when true.
+  //   channel_split=false, pre_relu=NO_RELU, pre_quant=NO_QUANT are defaults
+  //   and omitted by MLIR printer.
   this->stream << "hivm.hir.fixpipe {";
-  this->stream << "channel_split = " << (channel_split ? "true" : "false");
-  this->stream << (enable_nz2nd ? ", enable_nz2nd" : "");
-  this->stream << ", pre_relu = #hivm.fixpipe_pre_relu_mode<"
-               << fixpipe_pre_relu_mode[pre_relu_mode] << ">";
+  bool need_comma = false;
+  if (enable_nz2nd) {
+    this->stream << "enable_nz2nd";
+    need_comma = true;
+  }
   if (pre_quant_attr != "") {
-    this->stream << ", pre_quant = #hivm.fixpipe_pre_quant_mode<"
+    if (need_comma)
+      this->stream << ", ";
+    this->stream << "pre_quant = #hivm.fixpipe_pre_quant_mode<"
                  << pre_quant_attr << ">";
+    need_comma = true;
   }
   this->stream << "}";
   this->stream << " ins(%" << src_data_name << " : "
@@ -1258,7 +1407,7 @@ void CodeGenTileLangNPUIR::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(Op::Get("tl.npuir_sync_block_wait"))) {
     tvm::tl::NpuirSyncBlockWait sync_op(op->args, this->vmap);
     SyncBlockWaitCodegen(sync_op, os);
-  } else if (op->op.same_as(Op::Get("tl.ascend_copy"))) {
+  } else if (op->op.same_as(Op::Get("tl.copy"))) {
     AscendCopyCodegen(op, os);
   } else if (op->op.same_as(Op::Get("tl.npuir_add"))) {
     BinaryVecOpCodegen(op, "add", os);
@@ -1329,7 +1478,14 @@ void CodeGenTileLangNPUIR::VisitStmt_(const AttrStmtNode *op) {
       this->PrintIndent();
       this->stream << "%" << this->block_id_ << " = arith.trunci %"
                    << this->block_id_ << "_i64 : i64 to i32\n";
-      this->core_num_ = op->value.as<IntImmNode>()->value;
+      if (const auto *extent = op->value.as<IntImmNode>()) {
+        this->core_num_ = extent->value;
+      } else {
+        // Dynamic grid extents are passed to the runtime.  `core_num_` is
+        // only used by the disabled legacy host-stub generator, so it must
+        // not force a compile-time constant in the device string backend.
+        this->core_num_ = 0;
+      }
     } else if (iv->thread_tag == "blockIdx.y" && iv->var->name_hint != "_") {
       auto vec_id_ = AllocVarID(iv->var.get());
       this->PrintIndent();
@@ -1560,17 +1716,73 @@ void CodeGenTileLangNPUIR::GenRecastFromArg(Buffer curr_buffer, String arg_name,
                                             String &recast_inst) {
   // reinterpret_cast memref from 1D to xD
   std::ostringstream res;
-  String target_strides = GetBufferStrides(curr_buffer);
   String cast_name = arg_name + "_Recast";
   // add new memref obj
   this->type_info[cast_name] = new Memref(cast_name, curr_buffer);
+
+  // reinterpret_cast requires index-typed dynamic sizes and strides.  This
+  // function is called while emitting the function signature, so the casts
+  // must be retained in `recast_inst` and inserted later in the function
+  // body, rather than emitted through PrintExpr here.
+  std::vector<String> shape_values;
+  for (size_t i = 0; i < curr_buffer->shape.size(); ++i) {
+    PrimExpr dim = curr_buffer->shape[i];
+    if (auto dim_int = as_const_int(dim)) {
+      shape_values.push_back(std::to_string(*dim_int));
+      continue;
+    }
+
+    const auto *dim_var = dim.as<VarNode>();
+    ICHECK(dim_var)
+        << "NPUIR string codegen only supports Var dynamic buffer dimensions";
+    String value_name = arg_name + "_dim_" + std::to_string(i);
+    res << "%" << value_name
+        << " = arith.index_cast %"
+        // Buffer shape Vars are not necessarily pointer-identical to the
+        // corresponding PrimFunc parameter, so GetVarID/PrintExpr cannot be
+        // used here.  The argument was emitted under its TIR name hint.
+        << dim_var->name_hint << " : ";
+    PrintType(dim.dtype(), res);
+    res << " to index\n";
+    shape_values.push_back("%" + value_name);
+  }
+
+  // A contiguous rank-N buffer has stride[i] = product(shape[i + 1:]).
+  // Build products from the index-typed dynamic dimensions above, preserving
+  // static suffixes as integer literals.
+  std::vector<String> stride_values(curr_buffer->shape.size(), "1");
+  String running_stride = "1";
+  for (int i = static_cast<int>(curr_buffer->shape.size()) - 1; i >= 0; --i) {
+    stride_values[i] = running_stride;
+    if (i == 0) {
+      continue;
+    }
+    if (running_stride == "1") {
+      running_stride = shape_values[i];
+    } else if (shape_values[i] != "1") {
+      String value_name = arg_name + "_stride_" + std::to_string(i);
+      res << "%" << value_name << " = arith.muli " << shape_values[i] << ", "
+          << running_stride << " : index\n";
+      running_stride = "%" + value_name;
+    }
+  }
+
   res << "\%" << cast_name << " = ";
   res << "memref.reinterpret_cast \%";
   res << arg_name;
   res << " to offset: [0], sizes: [";
-  PrintShape(curr_buffer->shape, ", ", res);
-  res << "], strides: ";
-  res << target_strides;
+  for (size_t i = 0; i < shape_values.size(); ++i) {
+    if (i != 0)
+      res << ", ";
+    res << shape_values[i];
+  }
+  res << "], strides: [";
+  for (size_t i = 0; i < stride_values.size(); ++i) {
+    if (i != 0)
+      res << ", ";
+    res << stride_values[i];
+  }
+  res << "]";
   res << " : ";
   res << GetMemrefInfo(arg_name);
   res << " to ";
@@ -1719,7 +1931,8 @@ void CodeGenTileLangNPUIR::AddFunction(const GlobalVar &gvar,
 
   this->stream
       << "module attributes {hivm.module_core_type = #hivm.module_core_type<"
-      << NPU_CORETYPE_STR[this->func_coretype] << ">} {\n";
+      << NPU_CORETYPE_STR[this->func_coretype]
+      << ">, memref.memref_as_ptr} {\n";
 
   if (this->func_coretype == NPU_CORETYPE::MIX ||
       this->func_coretype == NPU_CORETYPE::AIC) {
@@ -1785,12 +1998,16 @@ String CodeGenTileLangNPUIR::GetMemrefInfo(Memref *memrefObj) {
         memref_type << memrefObj->stride_int[i];
       }
     }
-    memref_type << "], offset:";
-    if (memrefObj->var_offset)
-      memref_type << "?";
-    else
-      memref_type << memrefObj->offset;
-    memref_type << ">";
+    memref_type << "]";
+    // MLIR printer omits `offset:0` (default), only emits offset when non-zero
+    // or dynamic.  Match this behavior to align with API mode output.
+    if (memrefObj->var_offset) {
+      memref_type << ", offset: ?>";
+    } else if (memrefObj->offset != 0) {
+      memref_type << ", offset: " << memrefObj->offset << ">";
+    } else {
+      memref_type << ">";
+    }
   }
   memref_type << ", #hivm.address_space<" << memrefObj->address_space << ">>";
   memrefObj->type_str = memref_type.str();
@@ -1799,15 +2016,24 @@ String CodeGenTileLangNPUIR::GetMemrefInfo(Memref *memrefObj) {
 
 void Memref::GetIntStride() {
   if (stride.empty()) {
-    stride_int = GetStrideFromShape(shape);
-    for (unsigned long s : stride_int) {
-      stride.push_back(IntImm(DataType::Int(64), s));
+    // Preserve symbolic contiguous strides for dynamic shapes.  The previous
+    // implementation dropped dynamic dimensions, then indexed the shortened
+    // vector as if it still had `shape.size()` entries, causing a host-side
+    // segmentation fault before the MLIR string was produced.
+    std::vector<PrimExpr> contiguous_stride(shape.size());
+    PrimExpr running_stride =
+        IntImm(shape.empty() ? DataType::Int(64) : shape.back().dtype(), 1);
+    for (int i = static_cast<int>(shape.size()) - 1; i >= 0; --i) {
+      contiguous_stride[i] = running_stride;
+      running_stride = shape[i] * running_stride;
     }
-  } else {
-    for (PrimExpr s : stride) {
-      if (auto s_int = as_const_int(s))
-        stride_int.push_back(*s_int);
+    for (const PrimExpr &s : contiguous_stride) {
+      stride.push_back(s);
     }
+  }
+  for (const PrimExpr &s : stride) {
+    if (auto s_int = as_const_int(s))
+      stride_int.push_back(*s_int);
   }
 }
 
