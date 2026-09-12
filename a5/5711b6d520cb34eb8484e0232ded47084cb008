@@ -1,0 +1,23 @@
+src/target/codegen_npuir.cc
+  s_e8077c6a7dacad::t_dbcfd261136b11 135-139,168,675-783,794-822,824-838,840-842,1046-1052,1064,1073-1079,1102-1105,1107-1111,1113-1115,1117,1410,1481-1488,1722-1769,1774-1785,1934-1935,2001-2010,2019-2028,2030-2031,2034-2037
+src/target/codegen_npuir.h
+  s_e8077c6a7dacad::t_494f6a737a088c 158-159
+tilelang/engine/lower.py
+  s_e8077c6a7dacad::t_58629fcd6a509d 169-174
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "a55711b6d520cb34eb8484e0232ded47084cb008",
+  "prompts": {},
+  "sessions": {
+    "s_e8077c6a7dacad": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6aa39beff029e71ebb7755f1",
+        "model": "deepseek_v4_flash_official__dev"
+      },
+      "human_author": "looooooooooooooong <wuyulong18@huawei.com>"
+    }
+  }
+}
